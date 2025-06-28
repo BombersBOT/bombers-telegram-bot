@@ -3,7 +3,7 @@ name: Ejecutar bot Bombers
 on:
   schedule:
     - cron: '*/30 * * * *'  # Ejecutar cada 30 minutos
-  workflow_dispatch:         # Permite ejecutarlo manualmente desde GitHub
+  workflow_dispatch:        # Permite ejecutarlo manualmente desde GitHub
 
 jobs:
   run-bot:
@@ -13,15 +13,23 @@ jobs:
       - name: Clonar el repositorio
         uses: actions/checkout@v3
 
-      - name: Configurar Python 3.11
+      - name: Configurar Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      - name: Instalar dependencias
+      - name: Crear y activar entorno virtual + instalar dependencias
         run: |
+          python -m venv venv
+          source venv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pytz
+
+      - name: Listar paquetes instalados (diagnóstico)
+        run: |
+          source venv/bin/activate
+          pip list
 
       - name: Ejecutar el bot
         env:
@@ -31,4 +39,7 @@ jobs:
           TW_ACCESS_SECRET: ${{ secrets.TW_ACCESS_SECRET }}
           MIN_DOTACIONS: "5"
           GEOCODER_USER_AGENT: bombers_bot_1.0
-        run: python bombers_bot.py
+        run: |
+          source venv/bin/activate
+          python bombers_bot.py
+
