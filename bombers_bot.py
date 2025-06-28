@@ -2,20 +2,8 @@
 """
 bombers_bot.py
 
-Bot que consulta la capa ArcGIS de Bombers de la Generalitat y publica (o
-simula) un tuit con la última intervención relevante.
-
-Dependencias:
-    - requests
-    - geopy
-    - tweepy
-
-Variables de entorno principales:
-    ARCGIS_LAYER_URL  (opcional, url base hasta .../FeatureServer/0)
-    MIN_DOTACIONS     (mínimo de dotacions para tuitear, por defecto 5)
-    IS_TEST_MODE      ("true" ➜ solo simula; "false" ➜ publica)
-    GEOCODER_USER_AGENT
-    TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET
+Bot que consulta la capa ArcGIS de Bombers de la Generalitat
+y publica (o simula) un tuit con la última intervención relevante.
 """
 
 import os
@@ -27,9 +15,7 @@ from pathlib import Path
 from geopy.geocoders import Nominatim
 import tweepy
 
-# ----------------------------------------------------------------------
-# CONFIGURACIÓN
-# ----------------------------------------------------------------------
+# --------------------- CONFIGURACIÓN ----------------------------------
 LAYER_URL = os.getenv(
     "ARCGIS_LAYER_URL",
     "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
@@ -49,9 +35,7 @@ TW_ACCESS_SECRET = os.getenv("TW_ACCESS_SECRET")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ----------------------------------------------------------------------
-# UTILIDADES DE ESTADO
-# ----------------------------------------------------------------------
+# -------------------- ESTADO ------------------------------------------
 def load_state():
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
@@ -61,28 +45,26 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state))
     logging.info(f"Estado guardado: last_id = {state.get('last_id')}")
 
-# ----------------------------------------------------------------------
-# CONSULTA ARCGIS (1 intervención más reciente)
-# ----------------------------------------------------------------------
+# -------------------- CONSULTA ARCGIS ---------------------------------
 def query_latest_feature():
+    """Devuelve la última intervención (lat/lon en WGS‑84 gracias a outSR=4326)."""
     url = f"{LAYER_URL}/query"
     params = {
         "where": "1=1",
         "outFields": "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO",
         "orderByFields": "ACT_DAT_ACTUACIO desc",
         "f": "json",
-        "resultRecordCount": "1",   # solo la más reciente
+        "resultRecordCount": "1",        # solo la más reciente
         "returnGeometry": "true",
+        "outSR": "4326",                 # ← coordenadas en lat/lon
         "cacheHint": "true"
     }
-    response = requests.get(url, params=params, timeout=15)
-    response.raise_for_status()
-    feats = response.json().get("features", [])
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    feats = r.json().get("features", [])
     return feats[0] if feats else None
 
-# ----------------------------------------------------------------------
-# FILTRO Y FORMATEO
-# ----------------------------------------------------------------------
+# -------------------- UTILIDADES --------------------------------------
 def looks_relevant(attrs):
     return attrs.get("ACT_NUM_VEH", 0) >= MIN_DOTACIONS
 
@@ -119,15 +101,13 @@ def tweet(text, api):
     else:
         api.update_status(text)
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
+# -------------------- MAIN --------------------------------------------
 def main():
-    # Twitter solo si se va a publicar realmente
+    # Autenticación Twitter si se va a publicar
     api = None
     if not IS_TEST_MODE:
         if not all([TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]):
-            logging.error("Faltan claves API de Twitter en variables de entorno.")
+            logging.error("Faltan claves API de Twitter.")
             return
         auth = tweepy.OAuth1UserHandler(
             TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET
@@ -135,39 +115,35 @@ def main():
         api = tweepy.API(auth)
 
     state = load_state()
-    last_id = state.get("last_id", 0)
+    last_id = state["last_id"]
 
     feat = query_latest_feature()
     if not feat:
-        logging.info("No se encontraron intervenciones en la capa.")
+        logging.info("No se encontraron intervenciones.")
         return
 
     attrs = feat["attributes"]
     obj_id = attrs["ESRI_OID"]
 
-    # Si ya la procesamos
     if obj_id <= last_id:
-        logging.info("La intervención más reciente ya se procesó anteriormente.")
+        logging.info("La intervención más reciente ya se procesó.")
         return
 
-    # Si no alcanza mínimo de dotacions
     if not looks_relevant(attrs):
         logging.info(
-            f"La intervención {obj_id} tiene {attrs.get('ACT_NUM_VEH', 0)} dotacions; "
-            f"mínimo requerido: {MIN_DOTACIONS}. No se tuitea."
+            f"Intervención {obj_id} con {attrs.get('ACT_NUM_VEH', 0)} dotacions "
+            f"(mínimo {MIN_DOTACIONS}). No se tuitea."
         )
-        # Pero mostramos cómo quedaría el tuit
-        geom = feat.get("geometry")
-        place = reverse_geocode(geom["y"], geom["x"]) if geom else "Ubicación desconeguda"
-        print("PREVISUALIZACIÓN (no se publica):\n" + format_tweet(attrs, place))
+        geom = feat["geometry"]
+        preview = format_tweet(attrs, reverse_geocode(geom["y"], geom["x"]))
+        print("PREVISUALIZACIÓN (no se publica):\n" + preview)
         return
 
-    # --- Intervención relevante: preparamos tuit ---
-    geom = feat.get("geometry")
-    place = reverse_geocode(geom["y"], geom["x"]) if geom else "Ubicación desconeguda"
+    geom = feat["geometry"]
+    place = reverse_geocode(geom["y"], geom["x"])
     texto = format_tweet(attrs, place)
 
-    tweet(texto, api)  # imprime o publica
+    tweet(texto, api)
     save_state({"last_id": obj_id})
 
 if __name__ == "__main__":
