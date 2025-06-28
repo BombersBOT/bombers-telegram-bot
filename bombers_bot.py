@@ -78,10 +78,11 @@ def format_tweet(attrs, place):
              f"🕒 {hora}  |  🚒 {dot} dotacions treballant\n"
              f"{mapa_url}")
     return texto
-
+  
+texto = format_tweet(intervencion)
 def tweet(text, api):
     print("SIMULACIÓN — Publicaría este tuit:")
-print(format_tweet)
+print(texto)
 
 def main():
     if not all([TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]):
