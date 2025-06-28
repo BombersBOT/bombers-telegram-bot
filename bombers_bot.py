@@ -16,9 +16,12 @@ from pathlib import Path
 from geopy.geocoders import Nominatim
 import tweepy
 
-# Lee la URL desde la variable de entorno
-# Puede venir con o sin /query y con parámetros, el código lo gestiona
-LAYER_URL = os.getenv("ARCGIS_LAYER_URL").rstrip("/")
+# Usa la variable de entorno o el valor por defecto correcto
+LAYER_URL = os.getenv(
+    "ARCGIS_LAYER_URL",
+    "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
+    "ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0"
+).rstrip("/")
 
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
 STATE_FILE = Path("state.json")
@@ -43,19 +46,14 @@ def save_state(state):
     print(f"Estado guardado: last_id = {state.get('last_id')}")
 
 def build_query_url_and_params():
-    # Si LAYER_URL ya contiene /query (posible con parámetros)
     if "/query" in LAYER_URL:
-        # La URL base es la parte hasta /query, y luego los parámetros que ya tenga
         base_url, _, param_str = LAYER_URL.partition("/query")
         base_url += "/query"
-        # Extraemos parámetros ya presentes
-        from urllib.parse import parse_qs, urlparse
+        from urllib.parse import parse_qs
         query_params = {}
         if param_str.startswith("?"):
             query_params = parse_qs(param_str[1:])
-            # parse_qs devuelve listas, corregimos para requests
             query_params = {k: v[0] for k, v in query_params.items()}
-        # Añadimos o sobreescribimos parámetros importantes para la consulta
         query_params.update({
             "where": "1=1",
             "outFields": "ACT_NUM_VEH,COM_FASE,OBJECTID,Data",
@@ -68,7 +66,6 @@ def build_query_url_and_params():
         })
         return base_url, query_params
     else:
-        # No contiene /query, añadimos nosotros y los parámetros
         base_url = LAYER_URL + "/query"
         params = {
             "where": "1=1",
@@ -172,5 +169,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
