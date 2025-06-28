@@ -13,16 +13,15 @@ jobs:
       - name: Clonar el repositorio
         uses: actions/checkout@v3
 
-      - name: Configurar Python
+      - name: Configurar Python 3.11
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
       - name: Instalar dependencias
-        run: pip install -r requirements.txt
-
-      - name: Ejecutar script de prueba para última intervención
-        run: python test_intervencion.py
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Ejecutar el bot
         env:
