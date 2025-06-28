@@ -29,4 +29,5 @@ jobs:
           TW_ACCESS_SECRET: ${{ secrets.TW_ACCESS_SECRET }}
           MIN_DOTACIONS: "5"
           GEOCODER_USER_AGENT: bombers_bot_1.0
+          MODE_TEST: "False"  # Cambia a "True" para modo test (sin filtro)
         run: python bombers_bot.py
