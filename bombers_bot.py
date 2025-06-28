@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from geopy.geocoders import Nominatim
 import tweepy
-import time
 
 # Configuración desde variables de entorno
 LAYER_URL = os.getenv("ARCGIS_LAYER_URL",
@@ -29,16 +28,20 @@ TW_ACCESS_TOKEN = os.getenv("TW_ACCESS_TOKEN")
 TW_ACCESS_SECRET = os.getenv("TW_ACCESS_SECRET")
 
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "bombers_bot")
+IS_TEST_MODE = os.getenv("IS_TEST_MODE", "false").lower() == "true"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+
 
 def load_state():
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
     return {"last_id": 0}
 
+
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state))
+
 
 def query_arcgis():
     params = {
@@ -52,9 +55,11 @@ def query_arcgis():
     r.raise_for_status()
     return r.json().get("features", [])
 
+
 def looks_relevant(attrs):
     # Aquí decides qué es "relevante". Ejemplo:
     return attrs.get("nDotacions", 0) >= MIN_DOTACIONS
+
 
 def reverse_geocode(lat, lon, geocoder):
     try:
@@ -69,8 +74,9 @@ def reverse_geocode(lat, lon, geocoder):
         logging.warning(f"Reverse geocode error: {e}")
         return f"{lat:.3f}, {lon:.3f}"
 
+
 def format_tweet(attrs, place):
-    dt = datetime.utcfromtimestamp(attrs["Data"]/1000).replace(tzinfo=timezone.utc).astimezone()
+    dt = datetime.utcfromtimestamp(attrs["Data"] / 1000).replace(tzinfo=timezone.utc).astimezone()
     hora = dt.strftime("%H:%M")
     dot = attrs.get("nDotacions", "?")
     mapa_url = "https://experience.arcgis.com/experience/f6172fd2d6974bc0a8c51e3a6bc2a735"
@@ -78,11 +84,15 @@ def format_tweet(attrs, place):
              f"🕒 {hora}  |  🚒 {dot} dotacions treballant\n"
              f"{mapa_url}")
     return texto
-  
-texto = format_tweet(intervencion)
+
+
 def tweet(text, api):
-    print("SIMULACIÓN — Publicaría este tuit:")
-print(texto)
+    if IS_TEST_MODE:
+        print("SIMULACIÓN — Publicaría este tuit:")
+        print(text)
+    else:
+        api.update_status(text)
+
 
 def main():
     if not all([TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]):
@@ -116,12 +126,13 @@ def main():
 
         try:
             tweet(texto, api)
-            logging.info(f"Tuit enviado: {texto.replace(chr(10),' | ')}")
+            logging.info(f"Tuit enviado: {texto.replace(chr(10), ' | ')}")
             last_id = max(last_id, obj_id)
         except Exception as e:
             logging.error(f"Error enviando tuit {obj_id}: {e}")
 
     save_state({"last_id": last_id})
+
 
 if __name__ == "__main__":
     main()
