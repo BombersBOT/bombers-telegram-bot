@@ -16,12 +16,9 @@ from pathlib import Path
 from geopy.geocoders import Nominatim
 import tweepy
 
-# URL base SIN /query ni parámetros
-LAYER_URL = os.getenv(
-    "ARCGIS_LAYER_URL",
-    "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
-    "ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0"
-)
+# Lee la URL desde la variable de entorno
+# Puede venir con o sin /query y con parámetros, el código lo gestiona
+LAYER_URL = os.getenv("ARCGIS_LAYER_URL").rstrip("/")
 
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
 STATE_FILE = Path("state.json")
@@ -36,44 +33,65 @@ IS_TEST_MODE = os.getenv("IS_TEST_MODE", "true").lower() == "true"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-
 def load_state():
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
     return {"last_id": 0}
 
-
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state))
     print(f"Estado guardado: last_id = {state.get('last_id')}")
 
+def build_query_url_and_params():
+    # Si LAYER_URL ya contiene /query (posible con parámetros)
+    if "/query" in LAYER_URL:
+        # La URL base es la parte hasta /query, y luego los parámetros que ya tenga
+        base_url, _, param_str = LAYER_URL.partition("/query")
+        base_url += "/query"
+        # Extraemos parámetros ya presentes
+        from urllib.parse import parse_qs, urlparse
+        query_params = {}
+        if param_str.startswith("?"):
+            query_params = parse_qs(param_str[1:])
+            # parse_qs devuelve listas, corregimos para requests
+            query_params = {k: v[0] for k, v in query_params.items()}
+        # Añadimos o sobreescribimos parámetros importantes para la consulta
+        query_params.update({
+            "where": "1=1",
+            "outFields": "ACT_NUM_VEH,COM_FASE,OBJECTID,Data",
+            "orderByFields": "Data desc",
+            "f": "json",
+            "resultOffset": "0",
+            "resultRecordCount": "100",
+            "returnGeometry": "true",
+            "cacheHint": "true"
+        })
+        return base_url, query_params
+    else:
+        # No contiene /query, añadimos nosotros y los parámetros
+        base_url = LAYER_URL + "/query"
+        params = {
+            "where": "1=1",
+            "outFields": "ACT_NUM_VEH,COM_FASE,OBJECTID,Data",
+            "orderByFields": "Data desc",
+            "f": "json",
+            "resultOffset": "0",
+            "resultRecordCount": "100",
+            "returnGeometry": "true",
+            "cacheHint": "true"
+        }
+        return base_url, params
 
 def query_arcgis():
-    url = f"{LAYER_URL}/query"
-    params = {
-        "where": "1=1",
-        "outFields": "ACT_NUM_VEH,COM_FASE,OBJECTID,Data",
-        "orderByFields": "Data desc",
-        "f": "json",
-        "resultOffset": 0,
-        "resultRecordCount": 100,
-        "returnGeometry": True,
-        "cacheHint": True
-    }
-    # Muestra la URL final para depurar
-    prepared_url = requests.Request("GET", url, params=params).prepare().url
-    logging.info(f"Consulta URL: {prepared_url}")
-
+    url, params = build_query_url_and_params()
+    logging.info(f"Consulta URL: {requests.Request('GET', url, params=params).prepare().url}")
     response = requests.get(url, params=params, timeout=15)
     response.raise_for_status()
     data = response.json()
-    features = data.get("features", [])
-    return features
-
+    return data.get("features", [])
 
 def looks_relevant(attrs):
     return attrs.get("ACT_NUM_VEH", 0) >= MIN_DOTACIONS
-
 
 def reverse_geocode(lat, lon, geocoder):
     try:
@@ -88,7 +106,6 @@ def reverse_geocode(lat, lon, geocoder):
         logging.warning(f"Reverse geocode error: {e}")
         return f"{lat:.3f}, {lon:.3f}"
 
-
 def format_tweet(attrs, place):
     dt = datetime.utcfromtimestamp(attrs["Data"] / 1000).replace(tzinfo=timezone.utc).astimezone()
     hora = dt.strftime("%H:%M")
@@ -101,14 +118,12 @@ def format_tweet(attrs, place):
     )
     return texto
 
-
 def tweet(text, api):
     if IS_TEST_MODE:
         print("SIMULACIÓN — Publicaría este tuit:")
         print(text)
     else:
         api.update_status(text)
-
 
 def main():
     if not all([TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]):
@@ -154,7 +169,6 @@ def main():
             logging.error(f"Error enviando tuit {obj_id}: {e}")
 
     save_state({"last_id": last_id})
-
 
 if __name__ == "__main__":
     main()
