@@ -1,0 +1,32 @@
+name: Ejecutar bot Bombers
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Ejecutar cada 30 minutos
+  workflow_dispatch:         # Permite ejecutarlo manualmente desde GitHub
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clonar el repositorio
+        uses: actions/checkout@v3
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar el bot
+        env:
+          TW_CONSUMER_KEY: ${{ secrets.TW_CONSUMER_KEY }}
+          TW_CONSUMER_SECRET: ${{ secrets.TW_CONSUMER_SECRET }}
+          TW_ACCESS_TOKEN: ${{ secrets.TW_ACCESS_TOKEN }}
+          TW_ACCESS_SECRET: ${{ secrets.TW_ACCESS_SECRET }}
+          MIN_DOTACIONS: "5"
+          GEOCODER_USER_AGENT: bombers_bot_1.0
+        run: python bombers_bot.py
