@@ -41,6 +41,7 @@ def load_state():
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state))
+    print(f"Estado guardado: last_id = {state.get('last_id')}")
 
 
 def query_arcgis():
@@ -111,6 +112,10 @@ def main():
     except Exception as e:
         logging.error(f"Error consultando ArcGIS: {e}")
         return
+
+    print(f"Modo test: {IS_TEST_MODE}")
+    print(f"Last processed id: {last_id}")
+    print(f"Número de intervenciones consultadas: {len(features)}")
 
     for feat in features:
         obj_id = feat["attributes"]["OBJECTID"]
