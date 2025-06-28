@@ -11,65 +11,42 @@ import os
 import requests
 import logging
 from datetime import datetime
-import pytz
 from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+from geopy.exc import GeocoderTimedOut
+import pytz
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # Configuración
-LAYER_URL = os.getenv("ARCGIS_LAYER_URL", "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0/query")
-MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", 5))
+LAYER_URL = os.getenv("ARCGIS_LAYER_URL", "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/ACTUACIONS_URGENTS_online_PRO/FeatureServer/0/query")
+MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "bombers_bot_1.0")
+MODE_TEST = True  # Cambiar a False para publicar tweets
 
+# Inicializar geolocalizador
 geolocator = Nominatim(user_agent=GEOCODER_USER_AGENT)
-
-def classify_incident(attrs) -> str:
-    desc1 = attrs.get("TAL_DESC_ALARMA1", "") or ""
-    desc2 = attrs.get("TAL_DESC_ALARMA2", "") or ""
-    combined_desc = f"{desc1} {desc2}".lower().strip()
-
-    logging.info(f"Descripción TAL_DESC_ALARMA1: '{desc1}'")
-    logging.info(f"Descripción TAL_DESC_ALARMA2: '{desc2}'")
-    logging.info(f"Descripción combinada para clasificación: '{combined_desc}'")
-
-    if "vegetació urbana" in combined_desc:
-        return "urbà"
-    if "vegetación urbana" in combined_desc:
-        return "urbà"
-    if "urbà" in combined_desc or "urbano" in combined_desc:
-        return "urbà"
-    if "agrícola" in combined_desc or "agricola" in combined_desc:
-        return "agrícola"
-    if "forestal" in combined_desc:
-        return "forestal"
-    if "vegetació" in combined_desc or "vegetacion" in combined_desc:
-        return "forestal"
-
-    logging.warning("No se pudo clasificar la intervención, asignando forestal por defecto.")
-    return "forestal"
 
 def reverse_geocode(lat, lon):
     try:
-        location = geolocator.reverse((lat, lon), language='ca', exactly_one=True, timeout=10)
+        location = geolocator.reverse((lat, lon), language="ca", timeout=10)
         if location and location.address:
             return location.address
         else:
-            logging.warning("No se encontró dirección con reverse geocode, devolviendo coordenadas.")
-            return f"{lat:.5f}, {lon:.5f}"
-    except (GeocoderTimedOut, GeocoderServiceError) as e:
+            return None
+    except GeocoderTimedOut:
+        logging.warning("Reverse geocode timeout. Intentando de nuevo...")
+        return reverse_geocode(lat, lon)
+    except Exception as e:
         logging.warning(f"Reverse geocode error: {e}")
-        return f"{lat:.5f}, {lon:.5f}"
+        return None
 
-def fetch_interventions(last_id=0):
+def fetch_interventions():
     params = {
-        "f": "json",
-        "where": f"ESRI_OID > {last_id} AND TAL_COD_ALARMA1 = 'IV' AND ACT_NUM_VEH > 0",
-        "orderByFields": "ESRI_OID ASC",
+        "where": "TAL_COD_ALARMA1 = 'IV' AND ACT_NUM_VEH > 0",
         "outFields": "*",
-        "resultOffset": 0,
-        "resultRecordCount": 100,
-        "cacheHint": "true",
+        "orderByFields": "ACT_DAT_ACTUACIO desc",
+        "f": "json",
+        "resultRecordCount": 1
     }
     response = requests.get(LAYER_URL, params=params)
     response.raise_for_status()
@@ -77,94 +54,82 @@ def fetch_interventions(last_id=0):
     return data.get("features", [])
 
 def main():
-    last_id = 0  # Aquí podrías cargar desde un fichero o base de datos para continuar desde la última intervención
-
-    interventions = fetch_interventions(last_id)
+    interventions = fetch_interventions()
     logging.info(f"Número de intervenciones consultadas: {len(interventions)}")
-
+    
     if not interventions:
-        logging.info("No hay nuevas intervenciones.")
+        logging.info("No hay intervenciones nuevas.")
         return
-
-    # Procesar la última intervención (la de mayor ESRI_OID)
-    last_intervention = interventions[-1]
-    attrs = last_intervention["attributes"]
-    esri_oid = attrs.get("ESRI_OID", 0)
-    num_dotacions = attrs.get("ACT_NUM_VEH", 0)
-
-    logging.info(f"Intervención {esri_oid} con {num_dotacions} dotacions")
-
-    # Clasificar tipo incendio
-    incident_type = classify_incident(attrs)
-
-    # Extraer fecha y hora, ajustando a Madrid
-    utc_dt = None
-    if attrs.get("DATA_ACT"):
-        utc_dt = datetime.utcfromtimestamp(attrs["DATA_ACT"] / 1000)
-    elif attrs.get("ACT_DAT_ACTUACIO"):
-        utc_dt = datetime.utcfromtimestamp(attrs["ACT_DAT_ACTUACIO"] / 1000)
-
-    if utc_dt is None:
-        utc_dt = datetime.utcnow()
-
-    madrid_tz = pytz.timezone("Europe/Madrid")
-    local_dt = utc_dt.replace(tzinfo=pytz.utc).astimezone(madrid_tz)
-    hora_str = local_dt.strftime("%H:%M")
-
-    # Coordenadas (UTM ETRS89 / Zone 31N, EPSG:25831)
-    # NOTA: Hay que transformar las coordenadas a lat/lon para geopy
-    # Si no tienes librería para reproyección, usa un servicio o asume lat/lon
-    # Por ahora, extraemos del atributo, pero la API no da explícito lat/lon
-    # En este ejemplo asumimos que hay "X" y "Y" en atributos (debes confirmar)
-    try:
-        x = attrs.get("ACT_X_UTM", None) or attrs.get("ACT_X_UTM_DPX", None)
-        y = attrs.get("ACT_Y_UTM", None) or attrs.get("ACT_Y_UTM_DPX", None)
-        if x is not None and y is not None:
-            # Para transformar UTM a lat/lon usa pyproj, pero para simplificar, mostramos coords UTM
-            # Puedes instalar pyproj y hacer la transformación si quieres lat/lon exactos
-            lat, lon = None, None  # No implementado aquí
-            coords_text = f"coordenades UTM: {x}, {y}"
-        else:
-            lat = attrs.get("latitude")
-            lon = attrs.get("longitude")
-            coords_text = f"{lat}, {lon}" if lat and lon else "coordenades no disponibles"
-    except Exception as e:
-        logging.error(f"Error obteniendo coordenadas: {e}")
-        coords_text = "coordenades no disponibles"
-
-    # Intentar geocodificar si hay lat/lon
-    address = None
-    if lat is not None and lon is not None:
+    
+    latest = interventions[0]
+    attributes = latest["attributes"]
+    
+    act_id = attributes.get("ESRI_OID", "desconocido")
+    dotacions = attributes.get("ACT_NUM_VEH", 0)
+    
+    logging.info(f"Intervención {act_id} con {dotacions} dotacions.")
+    
+    if dotacions < MIN_DOTACIONS:
+        logging.info(f"La intervención {act_id} tiene {dotacions} dotacions (<{MIN_DOTACIONS}). No se tuitea.")
+        return
+    
+    # Determinar tipo de incendio
+    fire_text = attributes.get("TAL_DESC_ALARMA1", "").lower()
+    if "forestal" in fire_text:
+        fire_type = "incendi forestal"
+    elif "urbana" in fire_text or "urbà" in fire_text:
+        fire_type = "incendi urbà"
+    elif "agrícola" in fire_text or "agricola" in fire_text:
+        fire_type = "incendi agrícola"
+    else:
+        fire_type = "incendi"
+    
+    logging.info(f"Tipo de incendio detectado: {fire_type}")
+    
+    # Obtener ubicación
+    x_utm = attributes.get("ACT_X_UTM_DPX")
+    y_utm = attributes.get("ACT_Y_UTM_DPX")
+    
+    # Nota: si tienes coordenadas en UTM, hay que convertirlas a lat/lon.
+    # El sistema es EPSG:25831 (ETRS89 / UTM zone 31N).
+    # Para la simplificación, se asume que ACT_X_UTM_DPX es 'easting' y ACT_Y_UTM_DPX es 'northing'.
+    # Usamos pyproj para convertir:
+    from pyproj import Transformer
+    transformer = Transformer.from_crs("epsg:25831", "epsg:4326", always_xy=True)
+    if x_utm is None or y_utm is None:
+        # Si no hay coordenadas UTM, no se puede geolocalizar bien
+        location_str = "ubicació desconeguda"
+        lat, lon = None, None
+    else:
+        lon, lat = transformer.transform(x_utm, y_utm)
         address = reverse_geocode(lat, lon)
-
-    # Montar texto del tweet
-    loc_text = address if address else coords_text
-    dotacions_text = f"{num_dotacions} dotacions"
-    incident_map = {
-        "forestal": "Incendi forestal",
-        "urbà": "Incendi urbà",
-        "agrícola": "Incendi agrícola"
-    }
-    incident_text = incident_map.get(incident_type, "Incendi")
-
-    tweet_text = (
-        f"🔥 {incident_text} important a {loc_text}\n"
-        f"🕒 {hora_str}  |  🚒 {dotacions_text} treballant\n"
+        location_str = address if address else f"{lat:.5f}, {lon:.5f}"
+    
+    # Obtener fecha y hora en hora Madrid
+    dt_utc = attributes.get("ACT_DAT_ACTUACIO")
+    if dt_utc:
+        dt = datetime.utcfromtimestamp(dt_utc / 1000)
+        madrid_tz = pytz.timezone("Europe/Madrid")
+        dt_madrid = dt.replace(tzinfo=pytz.utc).astimezone(madrid_tz)
+        hora_str = dt_madrid.strftime("%H:%M")
+    else:
+        hora_str = "hora desconeguda"
+    
+    # Construir tweet
+    tweet = (
+        f"🔥 {fire_type} important a {location_str}\n"
+        f"🕒 {hora_str}  |  🚒 {dotacions} dotacions treballant\n"
         f"https://experience.arcgis.com/experience/f6172fd2d6974bc0a8c51e3a6bc2a735"
     )
-
-    # Solo publicar si hay dotaciones suficientes
-    if num_dotacions >= MIN_DOTACIONS:
-        logging.info(f"Publicando tweet:\n{tweet_text}")
-        # Aquí tu código para tuitear
-    else:
-        logging.info(f"Intervención {esri_oid} con {num_dotacions} dotacions (<{MIN_DOTACIONS}). No se tuitea.")
-        logging.info(f"PREVISUALIZACIÓN (no se publica):\n{tweet_text}")
-
-    # Guardar último id para la próxima ejecución (implementa según tu necesidad)
-    last_id = esri_oid
-    logging.info(f"Estado guardado: last_id = {last_id}")
+    
+    logging.info("PREVISUALIZACIÓN (no se publica):")
+    logging.info(tweet)
+    
+    if not MODE_TEST:
+        # Aquí iría el código para publicar el tweet
+        pass
 
 if __name__ == "__main__":
     main()
+
 
