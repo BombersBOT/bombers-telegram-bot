@@ -28,7 +28,7 @@ TW_ACCESS_TOKEN = os.getenv("TW_ACCESS_TOKEN")
 TW_ACCESS_SECRET = os.getenv("TW_ACCESS_SECRET")
 
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "bombers_bot")
-IS_TEST_MODE = os.getenv("IS_TEST_MODE", "false").lower() == "true"
+IS_TEST_MODE = os.getenv("IS_TEST_MODE", "true").lower() == "true"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
