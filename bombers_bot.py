@@ -18,7 +18,7 @@ import tweepy
 
 # Configuración desde variables de entorno
 LAYER_URL = os.getenv("ARCGIS_LAYER_URL",
-                      "https://services3.arcgis.com/66nKhMG60t1qZlRC/arcgis/rest/services/Intervencions_dels_Bombers/FeatureServer/4")
+                      "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0/query?f=json&cacheHint=true&resultOffset=0&resultRecordCount=100&where=1%3D1&orderByFields=ESRI_OID%20ASC&outFields=ACT_NUM_VEH,COM_FASE,ESRI_OID")
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
 STATE_FILE = Path("state.json")
 
