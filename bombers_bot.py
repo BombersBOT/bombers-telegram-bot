@@ -14,16 +14,15 @@ from datetime import datetime
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 import pytz
+from pyproj import Transformer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Configuración
 LAYER_URL = os.getenv("ARCGIS_LAYER_URL", "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/ACTUACIONS_URGENTS_online_PRO/FeatureServer/0/query")
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "bombers_bot_1.0")
-MODE_TEST = True  # Cambiar a False para publicar tweets
+MODE_TEST = True
 
-# Inicializar geolocalizador
 geolocator = Nominatim(user_agent=GEOCODER_USER_AGENT)
 
 def reverse_geocode(lat, lon):
@@ -67,13 +66,13 @@ def main():
     act_id = attributes.get("ESRI_OID", "desconocido")
     dotacions = attributes.get("ACT_NUM_VEH", 0)
     
-    logging.info(f"Intervención {act_id} con {dotacions} dotacions.")
+    # Comentado el filtro de dotacions para pruebas
+    # if dotacions < MIN_DOTACIONS:
+    #     logging.info(f"La intervención {act_id} tiene {dotacions} dotacions (<{MIN_DOTACIONS}). No se tuitea.")
+    #     return
     
-    if dotacions < MIN_DOTACIONS:
-        logging.info(f"La intervención {act_id} tiene {dotacions} dotacions (<{MIN_DOTACIONS}). No se tuitea.")
-        return
+    logging.info(f"La intervención {act_id} tiene {dotacions} dotacions.")
     
-    # Determinar tipo de incendio
     fire_text = attributes.get("TAL_DESC_ALARMA1", "").lower()
     if "forestal" in fire_text:
         fire_type = "incendi forestal"
@@ -84,28 +83,21 @@ def main():
     else:
         fire_type = "incendi"
     
+    print(f"[DEBUG] Tipo de incendio detectado: {fire_type}")
     logging.info(f"Tipo de incendio detectado: {fire_type}")
     
-    # Obtener ubicación
     x_utm = attributes.get("ACT_X_UTM_DPX")
     y_utm = attributes.get("ACT_Y_UTM_DPX")
     
-    # Nota: si tienes coordenadas en UTM, hay que convertirlas a lat/lon.
-    # El sistema es EPSG:25831 (ETRS89 / UTM zone 31N).
-    # Para la simplificación, se asume que ACT_X_UTM_DPX es 'easting' y ACT_Y_UTM_DPX es 'northing'.
-    # Usamos pyproj para convertir:
-    from pyproj import Transformer
-    transformer = Transformer.from_crs("epsg:25831", "epsg:4326", always_xy=True)
     if x_utm is None or y_utm is None:
-        # Si no hay coordenadas UTM, no se puede geolocalizar bien
         location_str = "ubicació desconeguda"
         lat, lon = None, None
     else:
+        transformer = Transformer.from_crs("epsg:25831", "epsg:4326", always_xy=True)
         lon, lat = transformer.transform(x_utm, y_utm)
         address = reverse_geocode(lat, lon)
         location_str = address if address else f"{lat:.5f}, {lon:.5f}"
     
-    # Obtener fecha y hora en hora Madrid
     dt_utc = attributes.get("ACT_DAT_ACTUACIO")
     if dt_utc:
         dt = datetime.utcfromtimestamp(dt_utc / 1000)
@@ -115,7 +107,6 @@ def main():
     else:
         hora_str = "hora desconeguda"
     
-    # Construir tweet
     tweet = (
         f"🔥 {fire_type} important a {location_str}\n"
         f"🕒 {hora_str}  |  🚒 {dotacions} dotacions treballant\n"
@@ -126,10 +117,8 @@ def main():
     logging.info(tweet)
     
     if not MODE_TEST:
-        # Aquí iría el código para publicar el tweet
+        # Código para publicar tweet aquí
         pass
 
 if __name__ == "__main__":
     main()
-
-
