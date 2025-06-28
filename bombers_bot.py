@@ -11,90 +11,64 @@ import os
 import requests
 import logging
 from datetime import datetime
-import pytz
 from geopy.geocoders import Nominatim
-import tweepy
+from geopy.exc import GeocoderTimedOut
+import pytz
 
-# Configuración logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# Variables de entorno
-MODE_TEST = os.getenv("MODE_TEST", "True").lower() == "true"
+# Parámetros
+ARCGIS_URL = "https://services.arcgis.com/f6172fd2d6974bc0/arcgis/rest/services/ACTUACIONS_URGENTS_ONLINE_PRO/FeatureServer/0/query"
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "bombers_bot_1.0")
+MODE_TEST = os.getenv("MODE_TEST", "True").lower() == "true"
 
-# Twitter credentials
-TW_CONSUMER_KEY = os.getenv("TW_CONSUMER_KEY")
-TW_CONSUMER_SECRET = os.getenv("TW_CONSUMER_SECRET")
-TW_ACCESS_TOKEN = os.getenv("TW_ACCESS_TOKEN")
-TW_ACCESS_SECRET = os.getenv("TW_ACCESS_SECRET")
-
-# URL de la capa ArcGIS
-ARCGIS_LAYER_URL = os.getenv("ARCGIS_LAYER_URL")  # Ej: https://.../FeatureServer/0
-
-if not ARCGIS_LAYER_URL:
-    logging.error("Falta configurar ARCGIS_LAYER_URL")
-    exit(1)
-
-# Inicializar geocoder
+# Inicializamos geocoder
 geolocator = Nominatim(user_agent=GEOCODER_USER_AGENT)
 
-# Inicializar Twitter cliente (solo si no es modo test)
-if not MODE_TEST:
-    auth = tweepy.OAuth1UserHandler(
-        TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET
-    )
-    twitter_api = tweepy.API(auth)
-
-logging.info(f"Modo test: {MODE_TEST}")
-logging.info(f"Mínimo dotacions requerido para tuitear: {MIN_DOTACIONS}")
+def get_latest_interventions():
+    params = {
+        "where": "1=1",
+        "outFields": "*",
+        "orderByFields": "OBJECTID DESC",
+        "resultRecordCount": 1,
+        "f": "json"
+    }
+    try:
+        response = requests.get(ARCGIS_URL, params=params)
+        response.raise_for_status()
+        data = response.json()
+        features = data.get("features", [])
+        return features
+    except Exception as e:
+        logging.error(f"Error consultando ArcGIS: {e}")
+        return []
 
 def reverse_geocode(lat, lon):
     try:
-        location = geolocator.reverse((lat, lon), language="ca")
+        location = geolocator.reverse((lat, lon), exactly_one=True, language="ca")
         if location and location.address:
+            # Devolvemos la dirección más precisa posible
             return location.address
+        else:
+            return None
+    except GeocoderTimedOut:
+        logging.warning("Geocoder timed out")
+        return None
     except Exception as e:
-        logging.warning(f"Error en reverse geocode: {e}")
-    return None
+        logging.warning(f"Reverse geocode error: {e}")
+        return None
 
 def get_fire_type(desc):
-    desc = desc.lower()
-    if "urbana" in desc:
+    desc_lower = desc.lower()
+    if "urbana" in desc_lower or "vegetació urbana" in desc_lower:
         return "urbà"
-    elif "agrícola" in desc or "agrícola" in desc:
+    elif "agrícola" in desc_lower or "agricola" in desc_lower:
         return "agrícola"
-    elif "vegetació" in desc or "forestal" in desc:
+    elif "vegetació" in desc_lower or "forestal" in desc_lower:
         return "forestal"
     else:
         return "desconegut"
-
-def get_latest_interventions():
-    query_url = f"{ARCGIS_LAYER_URL}/query"
-    params = {
-        "where": "TAL_COD_ALARMA1 = 'IV' AND ACT_NUM_VEH > 0",
-        "outFields": "ACT_NUM_ACTUACIO,ACT_DAT_ACTUACIO,TAL_DESC_ALARMA1,MUNICIPI_SIG,ACT_X_UTM,ACT_Y_UTM,ACT_URGENT,ACT_NUM_VEH",
-        "orderByFields": "ACT_NUM_ACTUACIO DESC",
-        "f": "json",
-        "resultRecordCount": 5,
-    }
-    resp = requests.get(query_url, params=params)
-    resp.raise_for_status()
-    data = resp.json()
-    features = data.get("features", [])
-    logging.info(f"Número de intervenciones consultadas: {len(features)}")
-    return features
-
-def utm_to_latlon(x, y, zone=31, northern_hemisphere=True):
-    # Para UTM zona 31N (Catalunya). Usa pyproj si disponible
-    try:
-        import pyproj
-        proj_utm = pyproj.Proj(proj="utm", zone=zone, ellps="WGS84", south=not northern_hemisphere)
-        lon, lat = proj_utm(x, y, inverse=True)
-        return lat, lon
-    except ImportError:
-        logging.warning("pyproj no está instalado, se usarán coordenadas UTM sin convertir")
-        return y, x  # Simple fallback, no exacto
 
 def main():
     features = get_latest_interventions()
@@ -103,70 +77,72 @@ def main():
         return
 
     intervencion = features[0]["attributes"]
-    id_interv = intervencion.get("ACT_NUM_ACTUACIO")
-    fecha_utc = intervencion.get("ACT_DAT_ACTUACIO")
-    desc_alarma = intervencion.get("TAL_DESC_ALARMA1", "")
-    municipio = intervencion.get("MUNICIPI_SIG", "")
-    x_utm = intervencion.get("ACT_X_UTM")
-    y_utm = intervencion.get("ACT_Y_UTM")
-    urgent = intervencion.get("ACT_URGENT")
+    objectid = intervencion.get("OBJECTID")
     dotacions = intervencion.get("ACT_NUM_VEH", 0)
+    desc_alarma = intervencion.get("TAL_DESC_ALARMA1", "")
+    municipi = intervencion.get("MUNICIPI_DPX", "")
+    x_coord = intervencion.get("ACT_X_UTM_DPX")
+    y_coord = intervencion.get("ACT_Y_UTM_DPX")
+    data_hora = intervencion.get("ACT_DAT_ACTUACIO")
 
-    logging.info(f"Intervención {id_interv} con {dotacions} dotacions.")
-
-    # Convertir fecha UTC a Madrid
-    if fecha_utc:
-        # El campo fecha_utc está en milisegundos desde epoch
-        try:
-            fecha_ts = int(fecha_utc) / 1000
-            dt_utc = datetime.utcfromtimestamp(fecha_ts).replace(tzinfo=pytz.utc)
-            madrid_tz = pytz.timezone("Europe/Madrid")
-            dt_madrid = dt_utc.astimezone(madrid_tz)
-            hora_madrid = dt_madrid.strftime("%H:%M")
-        except Exception as e:
-            logging.warning(f"Error convirtiendo fecha: {e}")
-            hora_madrid = "Desconocida"
-    else:
-        hora_madrid = "Desconocida"
-
-    # Convertir coordenadas UTM a lat/lon
-    if x_utm is not None and y_utm is not None:
-        lat, lon = utm_to_latlon(x_utm, y_utm)
-    else:
-        lat, lon = None, None
-
-    if lat is not None and lon is not None:
-        direccion = reverse_geocode(lat, lon)
-    else:
-        direccion = None
+    logging.info(f"Intervención {objectid} con {dotacions} dotacions.")
+    logging.info(f"Campo TAL_DESC_ALARMA1: {desc_alarma}")
 
     tipo_incendi = get_fire_type(desc_alarma)
+    logging.info(f"Tipo de incendio detectado: {tipo_incendi}")
 
-    # Construir texto
-    loc_text = direccion if direccion else municipio if municipio else f"{lat},{lon}" if lat and lon else "ubicació desconeguda"
+    # Convertir fecha a hora Madrid
+    if data_hora:
+        dt_utc = datetime.utcfromtimestamp(data_hora / 1000)
+        madrid_tz = pytz.timezone("Europe/Madrid")
+        dt_madrid = pytz.utc.localize(dt_utc).astimezone(madrid_tz)
+        hora_str = dt_madrid.strftime("%H:%M")
+    else:
+        hora_str = "hora desconeguda"
 
-    tweet_text = (
-        f"🔥 Incendi {tipo_incendi} important a {loc_text}\n"
-        f"🕒 {hora_madrid}  |  🚒 {dotacions} dotacions treballant\n"
-        f"https://experience.arcgis.com/experience/f6172fd2d6974bc0a8c51e3a6bc2a735"
+    # Geocodificación inversa para obtener dirección
+    direccion = None
+    if x_coord and y_coord:
+        # Convertir UTM a lat/lon si es necesario o asumir que están en lat/lon
+        # Aquí suponemos que son coordenadas UTM (ETRS89 / UTM zone 31N - EPSG:25831)
+        # Necesitamos convertir a lat/lon
+        try:
+            import pyproj
+            proj_utm = pyproj.Proj("epsg:25831")
+            proj_latlon = pyproj.Proj(proj="latlong", datum="WGS84")
+            lon, lat = pyproj.transform(proj_utm, proj_latlon, x_coord, y_coord)
+            direccion = reverse_geocode(lat, lon)
+        except ImportError:
+            logging.warning("pyproj no instalado, se usará coordenadas sin convertir")
+            direccion = reverse_geocode(y_coord, x_coord)
+        except Exception as e:
+            logging.warning(f"Error en conversión coordenadas: {e}")
+            direccion = reverse_geocode(y_coord, x_coord)
+    else:
+        logging.warning("No hay coordenadas para geocodificar")
+
+    # Construcción texto para tweet
+    lugar = direccion or municipi or "ubicació desconeguda"
+    dotacions_text = f"{dotacions} dotacions" if dotacions else "sense dotacions"
+    tweet = (
+        f"🔥 Incendi {tipo_incendi} important a {lugar}\n"
+        f"🕒 {hora_str}  |  🚒 {dotacions_text} treballant\n"
+        "https://experience.arcgis.com/experience/f6172fd2d6974bc0a8c51e3a6bc2a735"
     )
 
-    # Filtro mínimo dotacions (solo si no es test)
-    if not MODE_TEST and dotacions < MIN_DOTACIONS:
-        logging.info(f"Intervención {id_interv} con {dotacions} dotacions (<{MIN_DOTACIONS}). No se tuitea.")
-        logging.info("PREVISUALIZACIÓN (no se publica):\n" + tweet_text)
-        return
-
-    # Mostrar previsualización
-    logging.info("PREVISUALIZACIÓN (o tuiteo real si no es test):\n" + tweet_text)
-
-    # Si no es modo test, tuitear
-    if not MODE_TEST:
-        try:
-            twitter_api.update_status(tweet_text)
-            logging.info("Tweet enviado correctamente.")
-        except Exception as e:
-            logging.error(f"Error al enviar tweet: {e}")
+    if MODE_TEST:
+        logging.info("Modo test activo, no se publica el tweet.")
+        logging.info("PREVISUALIZACIÓN (no se publica):")
+        print(tweet)
+    else:
+        if dotacions >= MIN_DOTACIONS:
+            # Aquí iría el código para publicar el tweet
+            logging.info("Publicando tweet:")
+            print(tweet)
+        else:
+            logging.info(f"Intervención {objectid} con {dotacions} dotacions (<{MIN_DOTACIONS}). No se tuitea.")
+            logging.info("PREVISUALIZACIÓN (no se publica):")
+            print(tweet)
 
 if __name__ == "__main__":
     main()
