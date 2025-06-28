@@ -16,8 +16,12 @@ from pathlib import Path
 from geopy.geocoders import Nominatim
 import tweepy
 
-LAYER_URL = os.getenv("ARCGIS_LAYER_URL",
-    "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0")
+# URL base del servicio (sin /query ni parámetros)
+LAYER_URL = os.getenv(
+    "ARCGIS_LAYER_URL",
+    "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
+    "ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0"
+)
 
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
 STATE_FILE = Path("state.json")
@@ -52,12 +56,13 @@ def query_arcgis():
         "f": "json",
         "resultOffset": 0,
         "resultRecordCount": 100,
-        "returnGeometry": True
+        "returnGeometry": True,
+        "cacheHint": True
     }
     url = f"{LAYER_URL}/query"
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json().get("features", [])
+    response = requests.get(url, params=params, timeout=15)
+    response.raise_for_status()
+    return response.json().get("features", [])
 
 
 def looks_relevant(attrs):
@@ -83,9 +88,11 @@ def format_tweet(attrs, place):
     hora = dt.strftime("%H:%M")
     dot = attrs.get("ACT_NUM_VEH", "?")
     mapa_url = "https://experience.arcgis.com/experience/f6172fd2d6974bc0a8c51e3a6bc2a735"
-    texto = (f"🔥 Incendi forestal important a {place}\n"
-             f"🕒 {hora}  |  🚒 {dot} dotacions treballant\n"
-             f"{mapa_url}")
+    texto = (
+        f"🔥 Incendi forestal important a {place}\n"
+        f"🕒 {hora}  |  🚒 {dot} dotacions treballant\n"
+        f"{mapa_url}"
+    )
     return texto
 
 
@@ -103,7 +110,9 @@ def main():
         return
 
     geocoder = Nominatim(user_agent=GEOCODER_USER_AGENT)
-    auth = tweepy.OAuth1UserHandler(TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET)
+    auth = tweepy.OAuth1UserHandler(
+        TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET
+    )
     api = tweepy.API(auth)
 
     state = load_state()
@@ -143,3 +152,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
