@@ -81,7 +81,7 @@ def format_tweet(attrs, place):
 
 def tweet(text, api):
     print("SIMULACIÓN — Publicaría este tuit:")
-print(tweet_text)
+print(format_tweet)
 
 def main():
     if not all([TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]):
