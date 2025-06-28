@@ -1,10 +1,21 @@
+#!/usr/bin/env python3
 """
 bombers_bot.py
 
-Bot que consulta la capa de ArcGIS de los Bombers de la Generalitat y publica
-en Twitter (X) nuevas actuaciones relevantes (incendios con muchas dotaciones).
+Bot que consulta la capa ArcGIS de Bombers de la Generalitat y publica (o
+simula) un tuit con la última intervención relevante.
 
-Dependencias: tweepy, requests, geopy
+Dependencias:
+    - requests
+    - geopy
+    - tweepy
+
+Variables de entorno principales:
+    ARCGIS_LAYER_URL  (opcional, url base hasta .../FeatureServer/0)
+    MIN_DOTACIONS     (mínimo de dotacions para tuitear, por defecto 5)
+    IS_TEST_MODE      ("true" ➜ solo simula; "false" ➜ publica)
+    GEOCODER_USER_AGENT
+    TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET
 """
 
 import os
@@ -26,15 +37,15 @@ LAYER_URL = os.getenv(
 )
 
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
+IS_TEST_MODE = os.getenv("IS_TEST_MODE", "true").lower() == "true"
+GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "bombers_bot")
+
 STATE_FILE = Path("state.json")
 
 TW_CONSUMER_KEY = os.getenv("TW_CONSUMER_KEY")
 TW_CONSUMER_SECRET = os.getenv("TW_CONSUMER_SECRET")
 TW_ACCESS_TOKEN = os.getenv("TW_ACCESS_TOKEN")
 TW_ACCESS_SECRET = os.getenv("TW_ACCESS_SECRET")
-
-GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "bombers_bot")
-IS_TEST_MODE = os.getenv("IS_TEST_MODE", "true").lower() == "true"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -51,7 +62,7 @@ def save_state(state):
     logging.info(f"Estado guardado: last_id = {state.get('last_id')}")
 
 # ----------------------------------------------------------------------
-# CONSULTA ARCGIS: solo 1 registro (el más reciente)
+# CONSULTA ARCGIS (1 intervención más reciente)
 # ----------------------------------------------------------------------
 def query_latest_feature():
     url = f"{LAYER_URL}/query"
@@ -60,18 +71,17 @@ def query_latest_feature():
         "outFields": "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO",
         "orderByFields": "ACT_DAT_ACTUACIO desc",
         "f": "json",
-        "resultRecordCount": "1",          # <‑‑ solo el más reciente
+        "resultRecordCount": "1",   # solo la más reciente
         "returnGeometry": "true",
         "cacheHint": "true"
     }
     response = requests.get(url, params=params, timeout=15)
     response.raise_for_status()
-    data = response.json()
-    feats = data.get("features", [])
+    feats = response.json().get("features", [])
     return feats[0] if feats else None
 
 # ----------------------------------------------------------------------
-# FILTRO, GEOCODING Y FORMATO DEL TUIT
+# FILTRO Y FORMATEO
 # ----------------------------------------------------------------------
 def looks_relevant(attrs):
     return attrs.get("ACT_NUM_VEH", 0) >= MIN_DOTACIONS
@@ -105,7 +115,7 @@ def format_tweet(attrs, place):
 
 def tweet(text, api):
     if IS_TEST_MODE:
-        logging.info("SIMULACIÓN — Este sería el tuit:\n" + text)
+        print("TUIT SIMULADO:\n" + text)
     else:
         api.update_status(text)
 
@@ -113,7 +123,7 @@ def tweet(text, api):
 # MAIN
 # ----------------------------------------------------------------------
 def main():
-    # Autenticación Twitter (si se va a publicar realmente)
+    # Twitter solo si se va a publicar realmente
     api = None
     if not IS_TEST_MODE:
         if not all([TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]):
@@ -124,9 +134,41 @@ def main():
         )
         api = tweepy.API(auth)
 
-    stat
+    state = load_state()
+    last_id = state.get("last_id", 0)
 
+    feat = query_latest_feature()
+    if not feat:
+        logging.info("No se encontraron intervenciones en la capa.")
+        return
 
+    attrs = feat["attributes"]
+    obj_id = attrs["ESRI_OID"]
 
+    # Si ya la procesamos
+    if obj_id <= last_id:
+        logging.info("La intervención más reciente ya se procesó anteriormente.")
+        return
 
+    # Si no alcanza mínimo de dotacions
+    if not looks_relevant(attrs):
+        logging.info(
+            f"La intervención {obj_id} tiene {attrs.get('ACT_NUM_VEH', 0)} dotacions; "
+            f"mínimo requerido: {MIN_DOTACIONS}. No se tuitea."
+        )
+        # Pero mostramos cómo quedaría el tuit
+        geom = feat.get("geometry")
+        place = reverse_geocode(geom["y"], geom["x"]) if geom else "Ubicación desconeguda"
+        print("PREVISUALIZACIÓN (no se publica):\n" + format_tweet(attrs, place))
+        return
 
+    # --- Intervención relevante: preparamos tuit ---
+    geom = feat.get("geometry")
+    place = reverse_geocode(geom["y"], geom["x"]) if geom else "Ubicación desconeguda"
+    texto = format_tweet(attrs, place)
+
+    tweet(texto, api)  # imprime o publica
+    save_state({"last_id": obj_id})
+
+if __name__ == "__main__":
+    main()
