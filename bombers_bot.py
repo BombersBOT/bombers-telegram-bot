@@ -16,13 +16,9 @@ from pathlib import Path
 from geopy.geocoders import Nominatim
 import tweepy
 
-# Usa la variable de entorno o el valor por defecto correcto
-LAYER_URL = os.getenv(
-    "ARCGIS_LAYER_URL",
-    "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
-    "ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0"
-).rstrip("/")
-
+# Configuración variables entorno y constantes
+LAYER_URL = os.getenv("ARCGIS_LAYER_URL",
+                      "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0")
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
 STATE_FILE = Path("state.json")
 
@@ -43,49 +39,26 @@ def load_state():
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state))
-    print(f"Estado guardado: last_id = {state.get('last_id')}")
-
-def build_query_url_and_params():
-    if "/query" in LAYER_URL:
-        base_url, _, param_str = LAYER_URL.partition("/query")
-        base_url += "/query"
-        from urllib.parse import parse_qs
-        query_params = {}
-        if param_str.startswith("?"):
-            query_params = parse_qs(param_str[1:])
-            query_params = {k: v[0] for k, v in query_params.items()}
-        query_params.update({
-            "where": "1=1",
-            "outFields": "ACT_NUM_VEH,COM_FASE,OBJECTID,Data",
-            "orderByFields": "Data desc",
-            "f": "json",
-            "resultOffset": "0",
-            "resultRecordCount": "100",
-            "returnGeometry": "true",
-            "cacheHint": "true"
-        })
-        return base_url, query_params
-    else:
-        base_url = LAYER_URL + "/query"
-        params = {
-            "where": "1=1",
-            "outFields": "ACT_NUM_VEH,COM_FASE,OBJECTID,Data",
-            "orderByFields": "Data desc",
-            "f": "json",
-            "resultOffset": "0",
-            "resultRecordCount": "100",
-            "returnGeometry": "true",
-            "cacheHint": "true"
-        }
-        return base_url, params
+    logging.info(f"Estado guardado: last_id = {state.get('last_id')}")
 
 def query_arcgis():
-    url, params = build_query_url_and_params()
-    logging.info(f"Consulta URL: {requests.Request('GET', url, params=params).prepare().url}")
+    url = f"{LAYER_URL}/query"
+    params = {
+        "where": "1=1",
+        "outFields": "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO",
+        "orderByFields": "ACT_DAT_ACTUACIO desc",
+        "f": "json",
+        "resultOffset": "0",
+        "resultRecordCount": "100",
+        "returnGeometry": "true",
+        "cacheHint": "true"
+    }
     response = requests.get(url, params=params, timeout=15)
     response.raise_for_status()
     data = response.json()
-    return data.get("features", [])
+    features = data.get("features", [])
+    logging.info(f"Número de intervenciones consultadas: {len(features)}")
+    return features
 
 def looks_relevant(attrs):
     return attrs.get("ACT_NUM_VEH", 0) >= MIN_DOTACIONS
@@ -104,7 +77,8 @@ def reverse_geocode(lat, lon, geocoder):
         return f"{lat:.3f}, {lon:.3f}"
 
 def format_tweet(attrs, place):
-    dt = datetime.utcfromtimestamp(attrs["Data"] / 1000).replace(tzinfo=timezone.utc).astimezone()
+    # ACT_DAT_ACTUACIO es un timestamp en milisegundos desde epoch UTC
+    dt = datetime.utcfromtimestamp(attrs["ACT_DAT_ACTUACIO"] / 1000).replace(tzinfo=timezone.utc).astimezone()
     hora = dt.strftime("%H:%M")
     dot = attrs.get("ACT_NUM_VEH", "?")
     mapa_url = "https://experience.arcgis.com/experience/f6172fd2d6974bc0a8c51e3a6bc2a735"
@@ -128,9 +102,7 @@ def main():
         return
 
     geocoder = Nominatim(user_agent=GEOCODER_USER_AGENT)
-    auth = tweepy.OAuth1UserHandler(
-        TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET
-    )
+    auth = tweepy.OAuth1UserHandler(TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET)
     api = tweepy.API(auth)
 
     state = load_state()
@@ -144,19 +116,22 @@ def main():
 
     logging.info(f"Modo test: {IS_TEST_MODE}")
     logging.info(f"Last processed id: {last_id}")
-    logging.info(f"Número de intervenciones consultadas: {len(features)}")
 
     for feat in features:
-        obj_id = feat["attributes"]["OBJECTID"]
+        attrs = feat["attributes"]
+        obj_id = attrs["ESRI_OID"]
         if obj_id <= last_id:
             continue
-        if not looks_relevant(feat["attributes"]):
+        if not looks_relevant(attrs):
             continue
-
-        lat = feat["geometry"]["y"]
-        lon = feat["geometry"]["x"]
-        place = reverse_geocode(lat, lon, geocoder)
-        texto = format_tweet(feat["attributes"], place)
+        geom = feat.get("geometry")
+        if geom is None:
+            place = "Ubicación desconocida"
+        else:
+            lat = geom["y"]
+            lon = geom["x"]
+            place = reverse_geocode(lat, lon, geocoder)
+        texto = format_tweet(attrs, place)
 
         try:
             tweet(texto, api)
@@ -169,6 +144,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
