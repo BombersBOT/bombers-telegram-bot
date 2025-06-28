@@ -16,7 +16,7 @@ from pathlib import Path
 from geopy.geocoders import Nominatim
 import tweepy
 
-# URL base del servicio (sin /query ni parámetros)
+# URL base SIN /query ni parámetros
 LAYER_URL = os.getenv(
     "ARCGIS_LAYER_URL",
     "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
@@ -49,6 +49,7 @@ def save_state(state):
 
 
 def query_arcgis():
+    url = f"{LAYER_URL}/query"
     params = {
         "where": "1=1",
         "outFields": "ACT_NUM_VEH,COM_FASE,OBJECTID,Data",
@@ -59,10 +60,15 @@ def query_arcgis():
         "returnGeometry": True,
         "cacheHint": True
     }
-    url = f"{LAYER_URL}/query"
+    # Muestra la URL final para depurar
+    prepared_url = requests.Request("GET", url, params=params).prepare().url
+    logging.info(f"Consulta URL: {prepared_url}")
+
     response = requests.get(url, params=params, timeout=15)
     response.raise_for_status()
-    return response.json().get("features", [])
+    data = response.json()
+    features = data.get("features", [])
+    return features
 
 
 def looks_relevant(attrs):
@@ -124,9 +130,9 @@ def main():
         logging.error(f"Error consultando ArcGIS: {e}")
         return
 
-    print(f"Modo test: {IS_TEST_MODE}")
-    print(f"Last processed id: {last_id}")
-    print(f"Número de intervenciones consultadas: {len(features)}")
+    logging.info(f"Modo test: {IS_TEST_MODE}")
+    logging.info(f"Last processed id: {last_id}")
+    logging.info(f"Número de intervenciones consultadas: {len(features)}")
 
     for feat in features:
         obj_id = feat["attributes"]["OBJECTID"]
@@ -152,4 +158,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
