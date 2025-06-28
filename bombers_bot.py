@@ -16,9 +16,9 @@ from pathlib import Path
 from geopy.geocoders import Nominatim
 import tweepy
 
-# Configuración desde variables de entorno
 LAYER_URL = os.getenv("ARCGIS_LAYER_URL",
-                      "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0/query?f=json&cacheHint=true&resultOffset=0&resultRecordCount=100&where=1%3D1&orderByFields=ESRI_OID%20ASC&outFields=ACT_NUM_VEH,COM_FASE,ESRI_OID")
+    "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0")
+
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
 STATE_FILE = Path("state.json")
 
@@ -47,9 +47,12 @@ def save_state(state):
 def query_arcgis():
     params = {
         "where": "1=1",
-        "outFields": "*",
+        "outFields": "ACT_NUM_VEH,COM_FASE,OBJECTID,Data",
         "orderByFields": "Data desc",
-        "f": "json"
+        "f": "json",
+        "resultOffset": 0,
+        "resultRecordCount": 100,
+        "returnGeometry": True
     }
     url = f"{LAYER_URL}/query"
     r = requests.get(url, params=params, timeout=15)
@@ -58,8 +61,7 @@ def query_arcgis():
 
 
 def looks_relevant(attrs):
-    # Aquí decides qué es "relevante". Ejemplo:
-    return attrs.get("nDotacions", 0) >= MIN_DOTACIONS
+    return attrs.get("ACT_NUM_VEH", 0) >= MIN_DOTACIONS
 
 
 def reverse_geocode(lat, lon, geocoder):
@@ -79,7 +81,7 @@ def reverse_geocode(lat, lon, geocoder):
 def format_tweet(attrs, place):
     dt = datetime.utcfromtimestamp(attrs["Data"] / 1000).replace(tzinfo=timezone.utc).astimezone()
     hora = dt.strftime("%H:%M")
-    dot = attrs.get("nDotacions", "?")
+    dot = attrs.get("ACT_NUM_VEH", "?")
     mapa_url = "https://experience.arcgis.com/experience/f6172fd2d6974bc0a8c51e3a6bc2a735"
     texto = (f"🔥 Incendi forestal important a {place}\n"
              f"🕒 {hora}  |  🚒 {dot} dotacions treballant\n"
