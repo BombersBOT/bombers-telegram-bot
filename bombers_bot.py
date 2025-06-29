@@ -59,7 +59,7 @@ def query_latest_feature():
     """Devuelve la última intervención con dotacions > 0."""
     url = f"{LAYER_URL}/query"
     params = {
-        "where": "ACT_NUM_VEH > 0",
+        "where": "1=1",
         "outFields": (
             "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
             "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2"
