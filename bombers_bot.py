@@ -2,11 +2,10 @@
 """
 bombers_bot.py
 
-Consulta la capa ArcGIS de Bombers y publica (o simula) un tuit
-con la última intervenció rellevant, indicando tipo (forestal, urbà, agrícola)
-y la dirección lo más precisa posible.
+Consulta la capa ArcGIS “ACTUACIONS URGENTS online PRO” de Bombers
+y publica (o simula) un tuit con la última intervenció rellevant.
 
-Requisitos (requirements.txt):
+Dependencias (requirements.txt):
     requests
     geopy
     tweepy>=4.0.0
@@ -58,6 +57,7 @@ transformer = Transformer.from_crs(25831, 4326, always_xy=True)
 
 # --------------- ARC­GIS QUERY -----------------------------------------
 def query_latest_feature():
+    """Devuelve la última intervención (incluye desc. alarma y geometría UTM)."""
     url = f"{LAYER_URL}/query"
     params = {
         "where": "1=1",
@@ -81,38 +81,39 @@ def looks_relevant(attrs):
     return attrs.get("ACT_NUM_VEH", 0) >= MIN_DOTACIONS
 
 def classify_incident(attrs) -> str:
-    """
-    Devuelve 'forestal', 'urbà' o 'agrícola' basado en la descripción
-    (prioriza vegetació urbana sobre forestal).
-    """
+    """Devuelve forestal / urbà / agrícola (por defecto forestal)."""
     desc = (attrs.get("TAL_DESC_ALARMA1", "") + " " +
             attrs.get("TAL_DESC_ALARMA2", "")).lower()
 
-    if "vegetació urbana" in desc or "vegetación urbana" in desc:
-        return "urbà"
     if "urbà" in desc or "urbano" in desc:
         return "urbà"
-    if "agrícola" in desc or "agricola" in desc:
+    if "agrícola" in desc or "agrícola" in desc or "agricola" in desc:
         return "agrícola"
-    if "forestal" in desc:
+    # palabras clave vegetació forestal
+    if "forestal" in desc or "vegetació" in desc or "vegetacion" in desc:
         return "forestal"
-    if "vegetació" in desc or "vegetacion" in desc:
-        return "forestal"
-    return "forestal"
+    return "forestal"  # fallback
 
 geocoder = Nominatim(user_agent=GEOCODER_USER_AGENT)
 
 def utm_to_latlon(x, y):
-    lon, lat = transformer.transform(x, y)
+    lon, lat = transformer.transform(x, y)  # always_xy
     return lat, lon
 
 def reverse_geocode(lat, lon):
-    """Mejor precisión posible: calle y nº si existen."""
+    """
+    Devuelve:
+      • calle + nº + municipio
+      • calle + municipio
+      • municipio + provincia
+      • lat,lon si no hay datos
+    """
     try:
         loc = geocoder.reverse((lat, lon),
                                exactly_one=True,
                                timeout=10,
                                language="ca")
+
         if loc:
             adr = loc.raw.get("address", {})
             house = adr.get("house_number")
@@ -122,8 +123,11 @@ def reverse_geocode(lat, lon):
             county = adr.get("county") or adr.get("state_district")
 
             if road:
-                return f"{road}{' ' + house if house else ''}, {town or county}"
+                if house:
+                    return f"{road} {house}, {town or county}"
+                return f"{road}, {town or county}"
             return f"{town or county}, {adr.get('state', '')}".strip(", ")
+
     except Exception as e:
         logging.warning("Reverse geocode error: %s", e)
 
@@ -149,13 +153,16 @@ def tweet(text, api):
 
 # --------------- MAIN --------------------------------------------------
 def main():
+    # Autenticación Twitter si es producción
     api = None
     if not IS_TEST_MODE:
-        creds = [TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]
-        if not all(creds):
+        if not all([TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]):
             logging.error("Faltan credenciales de Twitter.")
             return
-        auth = tweepy.OAuth1UserHandler(*creds)
+        auth = tweepy.OAuth1UserHandler(
+            TW_CONSUMER_KEY, TW_CONSUMER_SECRET,
+            TW_ACCESS_TOKEN, TW_ACCESS_SECRET
+        )
         api = tweepy.API(auth)
 
     state   = load_state()
