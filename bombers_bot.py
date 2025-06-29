@@ -2,7 +2,7 @@
 """
 bombers_bot.py
 
-Consulta la capa ArcGIS “ACTUACIONS URGENTS online PRO” de Bombers
+Consulta la capa base de ArcGIS de Bombers
 y publica (o simula) un tuit con la última intervenció rellevant.
 
 Dependencias (requirements.txt):
@@ -25,10 +25,9 @@ from pyproj import Transformer
 import tweepy
 
 # ---------------- CONFIG ------------------------------------------------
-LAYER_URL = os.getenv(
-    "ARCGIS_LAYER_URL",
+LAYER_URL = (
     "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
-    "ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0"
+    "ACTUACIONS_URGENTS_online_PRO/FeatureServer/0"
 )
 MIN_DOTACIONS   = int(os.getenv("MIN_DOTACIONS", "5"))
 IS_TEST_MODE    = os.getenv("IS_TEST_MODE", "true").lower() == "true"
@@ -57,10 +56,10 @@ transformer = Transformer.from_crs(25831, 4326, always_xy=True)
 
 # --------------- ARC­GIS QUERY -----------------------------------------
 def query_latest_feature():
-    """Devuelve la última intervención (incluye desc. alarma y geometría UTM)."""
+    """Devuelve la última intervención con dotacions > 0."""
     url = f"{LAYER_URL}/query"
     params = {
-        "where": "1=1",
+        "where": "ACT_NUM_VEH > 0",
         "outFields": (
             "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
             "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2"
@@ -71,10 +70,18 @@ def query_latest_feature():
         "returnGeometry": "true",
         "cacheHint": "true",
     }
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    feats = r.json().get("features", [])
-    return feats[0] if feats else None
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        features = data.get("features", [])
+        logging.info("ArcGIS devolvió %s intervención(es)", len(features))
+        if not features:
+            logging.debug("Respuesta vacía: %s", json.dumps(data)[:300])
+        return features[0] if features else None
+    except Exception as e:
+        logging.error("Error consultando ArcGIS: %s", e)
+        return None
 
 # --------------- UTILIDADES --------------------------------------------
 def looks_relevant(attrs):
@@ -85,14 +92,13 @@ def classify_incident(attrs) -> str:
     desc = (attrs.get("TAL_DESC_ALARMA1", "") + " " +
             attrs.get("TAL_DESC_ALARMA2", "")).lower()
 
-    if "urbà" in desc or "urbano" in desc:
+    if "urbà" in desc or "urbano" in desc or "vegetació urbana" in desc:
         return "urbà"
-    if "agrícola" in desc or "agrícola" in desc or "agricola" in desc:
+    if "agrícola" in desc or "agricola" in desc:
         return "agrícola"
-    # palabras clave vegetació forestal
     if "forestal" in desc or "vegetació" in desc or "vegetacion" in desc:
         return "forestal"
-    return "forestal"  # fallback
+    return "forestal"
 
 geocoder = Nominatim(user_agent=GEOCODER_USER_AGENT)
 
@@ -101,19 +107,9 @@ def utm_to_latlon(x, y):
     return lat, lon
 
 def reverse_geocode(lat, lon):
-    """
-    Devuelve:
-      • calle + nº + municipio
-      • calle + municipio
-      • municipio + provincia
-      • lat,lon si no hay datos
-    """
+    """Devuelve dirección lo más precisa posible o coordenadas si falla."""
     try:
-        loc = geocoder.reverse((lat, lon),
-                               exactly_one=True,
-                               timeout=10,
-                               language="ca")
-
+        loc = geocoder.reverse((lat, lon), exactly_one=True, timeout=10, language="ca")
         if loc:
             adr = loc.raw.get("address", {})
             house = adr.get("house_number")
@@ -138,12 +134,16 @@ def format_tweet(attrs, place, incident_type):
                       .replace(tzinfo=timezone.utc)
     hora_local = dt_utc.astimezone(ZoneInfo("Europe/Madrid")).strftime("%H:%M")
     dot = attrs.get("ACT_NUM_VEH", "?")
-    mapa_url = ("https://experience.arcgis.com/experience/"
-                "f6172fd2d6974bc0a8c51e3a6bc2a735")
+    mapa_url = (
+        "https://experience.arcgis.com/experience/"
+        "f6172fd2d6974bc0a8c51e3a6bc2a735"
+    )
 
-    return (f"🔥 Incendi {incident_type} a {place}\n"
-            f"🕒 {hora_local}  |  🚒 {dot} dotacions treballant\n"
-            f"{mapa_url}")
+    return (
+        f"🔥 Incendi {incident_type} a {place}\n"
+        f"🕒 {hora_local}  |  🚒 {dot} dotacions treballant\n"
+        f"{mapa_url}"
+    )
 
 def tweet(text, api):
     if IS_TEST_MODE:
@@ -153,7 +153,7 @@ def tweet(text, api):
 
 # --------------- MAIN --------------------------------------------------
 def main():
-    # Autenticación Twitter si es producción
+    # Autenticación Twitter solo si no es test
     api = None
     if not IS_TEST_MODE:
         if not all([TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]):
@@ -198,3 +198,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
