@@ -2,8 +2,9 @@
 """
 bombers_bot.py
 
-Consulta la capa ArcGIS y publica un tuit con la intervención más reciente
-y otra relevante en fase 'actiu' o sin fase.
+Consulta la capa ArcGIS de Bombers y publica (o simula) un tuit
+con la última intervención relevante (mínimo 3 dotaciones), mostrando
+la más reciente y, si existe, otra con 3+ dotaciones en fase "actiu" o sin fase.
 
 Dependencias (requirements.txt):
     requests
@@ -30,7 +31,7 @@ LAYER_URL = os.getenv(
     "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
     "ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0"
 )
-MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
+MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "3"))  # Bajado a 3
 IS_TEST_MODE = os.getenv("IS_TEST_MODE", "true").lower() == "true"
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "bombers_bot")
 
@@ -58,7 +59,7 @@ transformer = Transformer.from_crs(25831, 4326, always_xy=True)
 # --------------- ARC­GIS QUERY -----------------------------------------
 def query_features():
     """
-    Devuelve todas las intervenciones recientes ordenadas por fecha descendente.
+    Devuelve intervenciones recientes ordenadas por fecha descendente.
     """
     url = f"{LAYER_URL}/query"
     params = {
@@ -74,8 +75,12 @@ def query_features():
         "cacheHint": "true",
     }
     r = requests.get(url, params=params, timeout=15)
+    logging.info("Consulta URL: %s", r.url)
     r.raise_for_status()
-    feats = r.json().get("features", [])
+    data = r.json()
+    logging.info("Respuesta keys: %s", list(data.keys()))
+    feats = data.get("features", [])
+    logging.info("Número de features recibidos: %d", len(feats))
     return feats
 
 # --------------- UTILIDADES --------------------------------------------
@@ -98,12 +103,16 @@ def classify_incident(attrs) -> str:
 geocoder = Nominatim(user_agent=GEOCODER_USER_AGENT)
 
 def utm_to_latlon(x, y):
-    lon, lat = transformer.transform(x, y)  # always_xy
+    lon, lat = transformer.transform(x, y)  # always_xy=True
     return lat, lon
 
 def reverse_geocode(lat, lon):
     """
-    Intenta obtener calle y municipio vía geocoder. Si falla, devolver None.
+    Devuelve:
+      • calle + nº + municipio
+      • calle + municipio
+      • municipio + provincia
+      • lat,lon si no hay datos
     """
     try:
         loc = geocoder.reverse((lat, lon),
@@ -123,17 +132,26 @@ def reverse_geocode(lat, lon):
                 if house:
                     return f"{road} {house}, {town or county}"
                 return f"{road}, {town or county}"
-            if town or county:
-                return f"{town or county}"
+            return f"{town or county}, {adr.get('state', '')}".strip(", ")
     except Exception as e:
         logging.warning("Reverse geocode error: %s", e)
+
     return None
 
+def format_place(attrs, lat, lon):
+    place = reverse_geocode(lat, lon)
+    if not place:
+        # Usa el campo municipio si no pudo obtener la dirección precisa
+        place = attrs.get("MUN_NOM", "ubicació desconeguda")
+    return place
+
 def format_tweet(attrs, place, incident_type):
-    dt_utc = datetime.utcfromtimestamp(attrs["ACT_DAT_ACTUACIO"] / 1000).replace(tzinfo=timezone.utc)
+    dt_utc = datetime.utcfromtimestamp(attrs["ACT_DAT_ACTUACIO"] / 1000)\
+                      .replace(tzinfo=timezone.utc)
     hora_local = dt_utc.astimezone(ZoneInfo("Europe/Madrid")).strftime("%H:%M")
     dot = attrs.get("ACT_NUM_VEH", "?")
-    mapa_url = "https://experience.arcgis.com/experience/f6172fd2d6974bc0a8c51e3a6bc2a735"
+    mapa_url = ("https://experience.arcgis.com/experience/"
+                "f6172fd2d6974bc0a8c51e3a6bc2a735")
 
     return (f"🔥 Incendi {incident_type} a {place}\n"
             f"🕒 {hora_local}  |  🚒 {dot} dotacions treballant\n"
@@ -147,6 +165,7 @@ def tweet(text, api):
 
 # --------------- MAIN --------------------------------------------------
 def main():
+    # Autenticación Twitter si es producción
     api = None
     if not IS_TEST_MODE:
         if not all([TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]):
@@ -160,60 +179,60 @@ def main():
 
     state = load_state()
     last_id = state["last_id"]
-    logging.info(f"Último ESRI_OID procesado: {last_id}")
+    logging.info("Último ESRI_OID procesado: %s", last_id)
 
     feats = query_features()
-    logging.info(f"Recibidas {len(feats)} intervenciones desde ArcGIS.")
-
-    # Buscar la intervención más reciente
-    most_recent = None
-    for f in feats:
-        obj_id = f["attributes"]["ESRI_OID"]
-        if obj_id > last_id:
-            most_recent = f
-            break
-
-    if not most_recent:
-        logging.info("No hay intervenciones nuevas.")
+    if not feats:
+        logging.info("No se encontraron intervenciones.")
         return
 
-    # Preparar datos para el tweet de la más reciente
-    attrs = most_recent["attributes"]
-    geom = most_recent.get("geometry", {})
-    lat, lon = utm_to_latlon(geom.get("x", 0), geom.get("y", 0))
-    place = reverse_geocode(lat, lon) or attrs.get("MUN_NOM") or "ubicació desconeguda"
-    incident_type = classify_incident(attrs)
+    # Ordenamos por ACT_DAT_ACTUACIO descendente (por si acaso)
+    feats.sort(key=lambda f: f["attributes"]["ACT_DAT_ACTUACIO"], reverse=True)
 
-    tweets_to_post = []
+    # Seleccionamos la más reciente (sin filtro mínimo dotaciones)
+    latest_feat = feats[0]
+    latest_attrs = latest_feat["attributes"]
 
-    tweets_to_post.append(format_tweet(attrs, place, incident_type))
-
-    # Buscar otra intervención con dotaciones >= MIN_DOTACIONS y en fase 'actiu' o sin fase
-    for f in feats:
-        attrs_f = f["attributes"]
-        obj_id_f = attrs_f["ESRI_OID"]
-        if obj_id_f <= last_id or obj_id_f == attrs["ESRI_OID"]:
+    # Buscamos otra con dotaciones >= MIN_DOTACIONS y fase actiu o sin fase,
+    # diferente a la más reciente y que no esté ya procesada
+    candidate_feat = None
+    for feat in feats[1:]:
+        attrs = feat["attributes"]
+        if attrs["ESRI_OID"] <= last_id:
             continue
-        dot = attrs_f.get("ACT_NUM_VEH", 0)
-        fase = attrs_f.get("COM_FASE", "") or ""
-        if dot >= MIN_DOTACIONS and (fase.lower() == "actiu" or fase == ""):
-            geom_f = f.get("geometry", {})
-            lat_f, lon_f = utm_to_latlon(geom_f.get("x", 0), geom_f.get("y", 0))
-            place_f = reverse_geocode(lat_f, lon_f) or attrs_f.get("MUN_NOM") or "ubicació desconeguda"
-            incident_type_f = classify_incident(attrs_f)
-            tweets_to_post.append(format_tweet(attrs_f, place_f, incident_type_f))
-            break
+        if looks_relevant(attrs):
+            fase = attrs.get("COM_FASE", "").lower()
+            if fase == "" or "actiu" in fase:
+                candidate_feat = feat
+                break
 
-    if not tweets_to_post:
+    # Procesar solo la más reciente y la candidata si cumplen condiciones
+    to_process = []
+
+    if latest_attrs["ESRI_OID"] > last_id:
+        to_process.append(latest_feat)
+
+    if candidate_feat and candidate_feat["attributes"]["ESRI_OID"] > last_id:
+        to_process.append(candidate_feat)
+
+    if not to_process:
         logging.info("No hay intervenciones nuevas y relevantes.")
         return
 
-    for t in tweets_to_post:
-        tweet(t, api)
+    for feat in to_process:
+        attrs = feat["attributes"]
+        obj_id = attrs["ESRI_OID"]
+        dot = attrs.get("ACT_NUM_VEH", 0)
+        geom = feat.get("geometry")
+        lat, lon = (None, None)
+        if geom:
+            lat, lon = utm_to_latlon(geom["x"], geom["y"])
+        place = format_place(attrs, lat, lon)
+        incident_type = classify_incident(attrs)
 
-    # Guardar el último ESRI_OID procesado (el mayor de los dos)
-    max_id = max(f["attributes"]["ESRI_OID"] for f in feats)
-    save_state({"last_id": max_id})
+        texto = format_tweet(attrs, place, incident_type)
+        tweet(texto, api)
+        save_state({"last_id": obj_id})
 
 if __name__ == "__main__":
     main()
