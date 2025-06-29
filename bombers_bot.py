@@ -3,8 +3,7 @@
 bombers_bot.py
 
 Consulta la capa ArcGIS “ACTUACIONS URGENTS online PRO” de Bombers
-con autenticación mediante API key y publica (o simula) un tuit
-con la última intervenció rellevant.
+y publica (o simula) tuits con las intervenciones relevantes.
 
 Dependencias (requirements.txt):
     requests
@@ -57,15 +56,15 @@ def save_state(state):
 transformer = Transformer.from_crs(25831, 4326, always_xy=True)
 
 # --------------- ARC­GIS QUERY -----------------------------------------
-def query_latest_feature():
-    """Consulta la capa ArcGIS con token y devuelve la última intervención."""
+def query_features():
+    """Consulta la capa ArcGIS con token y devuelve todas las intervenciones recientes."""
     url = f"{LAYER_URL}/query"
     params = {
         "f": "json",
         "where": "1=1",
         "outFields": "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,TAL_DESC_ALARMA1,TAL_DESC_ALARMA2",
         "orderByFields": "ACT_DAT_ACTUACIO DESC",
-        "resultRecordCount": 1,
+        "resultRecordCount": 100,  # hasta 100 registros
         "returnGeometry": "true",
         "token": API_KEY,
     }
@@ -74,10 +73,10 @@ def query_latest_feature():
         r.raise_for_status()
         data = r.json()
         feats = data.get("features", [])
-        return feats[0] if feats else None
+        return feats
     except Exception as e:
         logging.error(f"Error en consulta ArcGIS: {e}")
-        return None
+        return []
 
 # --------------- UTILIDADES --------------------------------------------
 def looks_relevant(attrs):
@@ -156,35 +155,39 @@ def main():
     state = load_state()
     last_id = state["last_id"]
 
-    feat = query_latest_feature()
-    if not feat:
+    feats = query_features()
+    if not feats:
         logging.info("No hay intervenciones recientes.")
         return
 
-    attrs = feat["attributes"]
-    obj_id = attrs["ESRI_OID"]
+    # Filtramos las intervenciones nuevas y relevantes
+    nuevas_intervenciones = []
+    for feat in feats:
+        attrs = feat["attributes"]
+        obj_id = attrs["ESRI_OID"]
+        if obj_id <= last_id:
+            continue
+        if not looks_relevant(attrs):
+            continue
+        nuevas_intervenciones.append(feat)
 
-    if obj_id <= last_id:
-        logging.info(f"Intervención {obj_id} ya procesada.")
+    if not nuevas_intervenciones:
+        logging.info("No hay intervenciones nuevas y relevantes.")
         return
 
-    geom = feat.get("geometry")
-    if not geom:
-        logging.warning("No se encontró geometría para la intervención.")
-        return
-
-    lat, lon = utm_to_latlon(geom["x"], geom["y"])
-    place = reverse_geocode(lat, lon)
-    incident_type = classify_incident(attrs)
-
-    if not looks_relevant(attrs):
-        logging.info(f"Intervención {obj_id} con {attrs.get('ACT_NUM_VEH', 0)} dotacions (<{MIN_DOTACIONS}). No se tuitea.")
-        print("PREVISUALIZACIÓN (no se publica):\n" + format_tweet(attrs, place, incident_type))
-        return
-
-    texto = format_tweet(attrs, place, incident_type)
-    tweet(texto, api)
-    save_state({"last_id": obj_id})
+    for feat in nuevas_intervenciones:
+        attrs = feat["attributes"]
+        obj_id = attrs["ESRI_OID"]
+        geom = feat.get("geometry")
+        if not geom:
+            logging.warning(f"No se encontró geometría para la intervención {obj_id}.")
+            continue
+        lat, lon = utm_to_latlon(geom["x"], geom["y"])
+        place = reverse_geocode(lat, lon)
+        incident_type = classify_incident(attrs)
+        texto = format_tweet(attrs, place, incident_type)
+        tweet(texto, api)
+        save_state({"last_id": obj_id})
 
 if __name__ == "__main__":
     main()
