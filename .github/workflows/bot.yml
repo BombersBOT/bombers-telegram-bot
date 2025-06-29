@@ -1,8 +1,6 @@
 name: Ejecutar bot Bombers
 
 on:
-  schedule:
-    - cron: '*/30 * * * *'  # Ejecutar cada 30 minutos
   workflow_dispatch:         # Permite ejecutarlo manualmente desde GitHub
 
 jobs:
