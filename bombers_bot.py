@@ -15,6 +15,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from geopy.geocoders import Nominatim
 from pyproj import Transformer
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ---------------- CONFIG ------------------------------------------------
 LAYER_URL = ("https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
@@ -38,6 +40,12 @@ TW_KEYS = {
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 
+# Configuración de reintentos para requests
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+session = requests.Session()
+session.mount('https://', HTTPAdapter(max_retries=retries))
+
+
 # ---------------- ESTADO -----------------------------------------------
 def load_state() -> int:
     return json.loads(STATE_FILE.read_text()).get("last_id", -1) if STATE_FILE.exists() else -1
@@ -52,16 +60,26 @@ def fetch_features(limit=100):
         "where": "1=1",
         "outFields": (
             "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
-            "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2" # Vuelven los campos originales aquí
+            "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM_MUNICIPI" # Incluimos MUN_NOM_MUNICIPI
         ),
-        "orderByFields": "ACT_DAT_ACTUACIO DESC",  # espacio, no %20
+        "orderByFields": "ACT_DAT_ACTUACIO DESC",
         "resultRecordCount": limit,
         "returnGeometry": "true",
         "cacheHint": "true",
     }
     if API_KEY:
         params["token"] = API_KEY
-    r = requests.get(f"{LAYER_URL}/query", params=params, timeout=15)
+    
+    try:
+        r = session.get(f"{LAYER_URL}/query", params=params, timeout=30)
+        r.raise_for_status()
+    except requests.exceptions.Timeout:
+        logging.error("Error de timeout al consultar ArcGIS. El servidor no respondió a tiempo.")
+        return []
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error de conexión al consultar ArcGIS: {e}")
+        return []
+
     data = r.json()
     if "error" in data:
         logging.error("ArcGIS error %s: %s", data["error"]["code"], data["error"]["message"])
@@ -79,50 +97,50 @@ def utm_to_latlon(x, y):
     lon, lat = TRANSFORM.transform(x, y)
     return lat, lon
 
-def get_full_address_from_coords(geom):
+def get_street_from_coords(geom):
+    """
+    Intenta obtener solo el nombre de la calle (o lo más cercano) de las coordenadas.
+    """
     if geom:
         lat, lon = utm_to_latlon(geom["x"], geom["y"])
         try:
-            loc = GEOCODER.reverse((lat, lon), exactly_one=True, timeout=8, language="ca")
+            loc = GEOCODER.reverse((lat, lon), exactly_one=True, timeout=15, language="ca") 
             if loc and loc.address:
-                return loc.address
-        except Exception:
+                parts = loc.address.split(',')[0].strip().split(' ')
+                street_name_parts = []
+                for part in parts:
+                    if any(char.isdigit() for char in part):
+                        break 
+                    street_name_parts.append(part)
+                return " ".join(street_name_parts) if street_name_parts else ""
+        except Exception as e:
+            logging.debug(f"Error al geocodificar para la calle: {e}")
             pass
-    return "ubicació desconeguda"
+    return ""
+
 
 def format_intervention(a, geom):
-    full_address = get_full_address_from_coords(geom)
+    # Obtener el municipio directamente de los atributos de ArcGIS
+    municipio = a.get("MUN_NOM_MUNICIPI", "ubicació desconeguda")
     
-    # Intentamos extraer solo la calle y el municipio de la dirección completa
-    parts = [part.strip() for part in full_address.split(',')]
-    
-    # La calle suele ser la primera parte, y el municipio una de las siguientes
-    street = ""
-    municipality = ""
-
-    if parts:
-        street = parts[0] # Asumimos que la primera parte es la calle o lo más cercano
-        # Buscamos un posible municipio en las siguientes partes
-        for part in parts[1:]:
-            # Simple heurística: los municipios suelen ser palabras individuales
-            # o combinaciones sin números y que suenen a lugar
-            if not any(char.isdigit() for char in part) and len(part) > 2:
-                municipality = part
-                break
-
-    location_str = ""
-    if street != "ubicació desconeguda": # Si la calle no es la cadena de "ubicació desconeguda"
-        location_str = street
-        if municipality and municipality != street: # Aseguramos que el municipio no sea lo mismo que la calle si ya la tenemos
-             location_str = f"{street}, {municipality}"
-    elif municipality: # Si no tenemos calle pero sí municipio
-        location_str = municipality
-    else: # Si no tenemos ni calle ni municipio de la geocodificación
-        location_str = "ubicació desconeguda"
+    # Obtener la calle de la geocodificación
+    calle = get_street_from_coords(geom)
 
     hora = datetime.fromtimestamp(a["ACT_DAT_ACTUACIO"]/1000, tz=timezone.utc)\
                .astimezone(ZoneInfo("Europe/Madrid")).strftime("%H:%M")
     
+    location_str = ""
+    if calle:
+        # Si tenemos calle, la combinamos con el municipio (que siempre deberíamos tener de ArcGIS)
+        location_str = f"{calle}, {municipio}"
+    else:
+        # Si no pudimos obtener la calle, usamos solo el municipio
+        location_str = municipio
+    
+    # Si al final la ubicación sigue siendo 'desconocida', es que ni ArcGIS ni geocodificador lo dieron
+    if location_str.lower() == "ubicació desconeguda" and not calle:
+        location_str = "ubicació desconeguda"
+
     return (f"🔥 Incendi {classify(a)} a {location_str}\n"
             f"🕒 {hora} | 🚒 {a['ACT_NUM_VEH']} dotacions treballant")
 
@@ -134,7 +152,6 @@ def send(text, api):
 
 # ---------------- MAIN --------------------------------------------------
 def main():
-    # Twitter API (solo producción)
     api = None
     if not IS_TEST_MODE and all(TW_KEYS.values()):
         auth = tweepy.OAuth1UserHandler(TW_KEYS["ck"], TW_KEYS["cs"], TW_KEYS["at"], TW_KEYS["as"])
@@ -146,35 +163,56 @@ def main():
         logging.info("ArcGIS devolvió 0 features.")
         return
 
-    # candidatos activos con dotacions >= mínimo
-    candidatos = [
+    # Candidatos activos con dotaciones >= mínimo y más recientes que la última ID procesada
+    candidatos_activos = [
         f for f in feats
         if f["attributes"]["ACT_NUM_VEH"] >= MIN_DOTACIONS
            and (str(f["attributes"].get("COM_FASE") or "")).lower() in ("", "actiu")
            and f["attributes"]["ESRI_OID"] > last_id
     ]
-    candidatos.sort(
-        key=lambda f: (
-            -f["attributes"]["ACT_NUM_VEH"],
-            tipo_val(f["attributes"]),
-            -f["attributes"]["ACT_DAT_ACTUACIO"]
-        )
-    )
+    
+    # La intervención más reciente de todas las nuevas (sin importar dotaciones o fase)
+    first_new_overall = next((f for f in feats if f["attributes"]["ESRI_OID"] > last_id), None)
 
     intervenciones_para_tweet = []
 
-    if candidatos:
-        intervenciones_para_tweet.append({"title": "Incendi més rellevant", "feature": candidatos[0]})
-        # posible segunda intervención
-        for f in candidatos[1:]:
-            if f["attributes"]["ESRI_OID"] != intervenciones_para_tweet[0]["feature"]["attributes"]["ESRI_OID"]:
-                intervenciones_para_tweet.append({"title": "Actuació més recent", "feature": f})
-                break
-    else:
-        # fallback: la intervención más reciente no procesada
-        first_new = next((f for f in feats if f["attributes"]["ESRI_OID"] > last_id), None)
-        if first_new:
-            intervenciones_para_tweet.append({"title": "Actuació més recent", "feature": first_new})
+    # 1. Identificar la actuación más reciente (de todas las nuevas)
+    most_recent_feature = None
+    if first_new_overall:
+        most_recent_feature = first_new_overall
+        intervenciones_para_tweet.append({"title": "Actuació més recent", "feature": most_recent_feature})
+
+    # 2. Identificar la actuación más relevante (cumpliendo criterios de dotaciones/fase)
+    # y que NO sea la misma que la más reciente si ya la incluimos
+    most_relevant_feature = None
+    if candidatos_activos:
+        # Ordenamos los candidatos activos por relevancia (dotaciones, tipo, fecha)
+        candidatos_activos.sort(
+            key=lambda f: (
+                -f["attributes"]["ACT_NUM_VEH"],
+                tipo_val(f["attributes"]),
+                -f["attributes"]["ACT_DAT_ACTUACIO"]
+            )
+        )
+        # La primera de esta lista es la más relevante
+        potential_relevant = candidatos_activos[0]
+
+        # Solo la añadimos si no es la misma que la "más reciente"
+        if most_recent_feature is None or potential_relevant["attributes"]["ESRI_OID"] != most_recent_feature["attributes"]["ESRI_OID"]:
+            most_relevant_feature = potential_relevant
+            intervenciones_para_tweet.append({"title": "Incendi més rellevant", "feature": most_relevant_feature})
+    
+    # Si tenemos dos intervenciones, aseguramos el orden: la más reciente primero, luego la más relevante.
+    # Necesitamos una forma robusta de ordenar si ambas existen.
+    # El orden en `intervenciones_para_tweet` ya debería reflejarlo si `most_recent_feature` se añade primero.
+    # Si solo hay una, simplemente se añade.
+
+    # Si por alguna razón la "más relevante" se añade antes, o queremos forzar el orden final:
+    # reordenar si ambas están presentes
+    if len(intervenciones_para_tweet) == 2:
+        # Aseguramos que "Actuació més recent" vaya primero y "Incendi més rellevant" segundo
+        if intervenciones_para_tweet[0]["title"] == "Incendi més rellevant":
+            intervenciones_para_tweet.reverse() # Invertir el orden si la relevante está primera
 
     if not intervenciones_para_tweet:
         logging.info("No hay intervenciones nuevas para tuitear.")
