@@ -58,9 +58,10 @@ def fetch_features(limit=100):
     params = {
         "f": "json",
         "where": "1=1",
+        # ¡IMPORTANTE! Hemos reducido los outFields al mínimo + MUN_NOM_MUNICIPI
+        # para probar si el problema es la cantidad de campos solicitados.
         "outFields": (
-            "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
-            "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM_MUNICIPI" # Incluimos MUN_NOM_MUNICIPI
+            "ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,MUN_NOM_MUNICIPI" 
         ),
         "orderByFields": "ACT_DAT_ACTUACIO DESC",
         "resultRecordCount": limit,
@@ -82,8 +83,34 @@ def fetch_features(limit=100):
 
     data = r.json()
     if "error" in data:
+        # Aquí verificamos si el error 400 es por el parámetro de consulta.
         logging.error("ArcGIS error %s: %s", data["error"]["code"], data["error"]["message"])
-        return []
+        # Si el error persiste con MUN_NOM_MUNICIPI, volvemos a la consulta sin él
+        # y registramos que no pudimos obtener el municipio directamente.
+        if data["error"]["code"] == 400 and "Invalid query parameters" in data["error"]["message"]:
+            logging.warning("No se pudo obtener MUN_NOM_MUNICIPI directamente de ArcGIS. Intentando sin él.")
+            params["outFields"] = ("ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
+                                   "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
+            try:
+                r = session.get(f"{LAYER_URL}/query", params=params, timeout=30)
+                r.raise_for_status()
+                data = r.json()
+                if "error" in data: # Doble chequeo por si hay otro error
+                    logging.error("ArcGIS fallback error %s: %s", data["error"]["code"], data["error"]["message"])
+                    return []
+                # Añadimos un marcador para saber que el municipio no vino de ArcGIS
+                for feature in data.get("features", []):
+                    feature["attributes"]["MUN_NOM_MUNICIPI_FROM_ARCGIS"] = False
+                return data.get("features", [])
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Error de conexión en fallback de ArcGIS: {e}")
+                return []
+
+        return [] # Si es otro tipo de error de ArcGIS, simplemente retornamos vacío
+    
+    # Marcador para saber que el municipio SÍ vino de ArcGIS
+    for feature in data.get("features", []):
+        feature["attributes"]["MUN_NOM_MUNICIPI_FROM_ARCGIS"] = True
     return data.get("features", [])
 
 # ---------------- UTILIDADES -------------------------------------------
@@ -97,48 +124,80 @@ def utm_to_latlon(x, y):
     lon, lat = TRANSFORM.transform(x, y)
     return lat, lon
 
-def get_street_from_coords(geom):
+def get_address_components_from_coords(geom):
     """
-    Intenta obtener solo el nombre de la calle (o lo más cercano) de las coordenadas.
+    Obtiene la dirección completa de las coordenadas y la parsea en componentes.
+    Devuelve un diccionario con 'street', 'municipality', 'full_address'.
     """
+    street = ""
+    municipality = ""
+    full_address = "ubicació desconeguda"
+
     if geom:
         lat, lon = utm_to_latlon(geom["x"], geom["y"])
         try:
-            loc = GEOCODER.reverse((lat, lon), exactly_one=True, timeout=15, language="ca") 
+            loc = GEOCODER.reverse((lat, lon), exactly_one=True, timeout=15, language="ca")
             if loc and loc.address:
-                parts = loc.address.split(',')[0].strip().split(' ')
-                street_name_parts = []
-                for part in parts:
-                    if any(char.isdigit() for char in part):
-                        break 
-                    street_name_parts.append(part)
-                return " ".join(street_name_parts) if street_name_parts else ""
+                full_address = loc.address
+                # Intentar extraer componentes más específicos de Nominatim si están disponibles
+                address_parts = loc.raw.get('address', {})
+                street = address_parts.get('road', '')
+                if not street: # A veces 'road' no está, buscar en otras propiedades comunes de calle
+                    street = address_parts.get('building', '') or address_parts.get('amenity', '')
+                
+                municipality = address_parts.get('city', '') or \
+                               address_parts.get('town', '') or \
+                               address_parts.get('village', '')
+                
+                # Fallback para municipio si no se encuentra directamente
+                if not municipality:
+                    parts = [p.strip() for p in full_address.split(',')]
+                    for p in reversed(parts): # Buscar desde el final
+                        if not any(char.isdigit() for char in p) and len(p) > 2 and p.lower() not in ["catalunya", "españa"]:
+                            municipality = p
+                            break
+
         except Exception as e:
-            logging.debug(f"Error al geocodificar para la calle: {e}")
+            logging.debug(f"Error al geocodificar: {e}")
             pass
-    return ""
+    
+    return {"street": street, "municipality": municipality, "full_address": full_address}
 
 
 def format_intervention(a, geom):
-    # Obtener el municipio directamente de los atributos de ArcGIS
-    municipio = a.get("MUN_NOM_MUNICIPI", "ubicació desconeguda")
+    # Intentar obtener el municipio de ArcGIS
+    municipio_arcgis = a.get("MUN_NOM_MUNICIPI")
     
-    # Obtener la calle de la geocodificación
-    calle = get_street_from_coords(geom)
+    # Bandera para saber si el municipio vino de ArcGIS o no (establecida en fetch_features)
+    municipio_from_arcgis_success = a.get("MUN_NOM_MUNICIPI_FROM_ARCGIS", False)
+
+    calle = ""
+    municipio_final = "ubicació desconeguda"
+
+    if municipio_arcgis and municipio_from_arcgis_success:
+        municipio_final = municipio_arcgis # Usar el de ArcGIS si lo tenemos y se obtuvo con éxito
+    
+    # Siempre intentamos obtener la calle y un municipio de la geocodificación
+    # Esto es útil si el municipio de ArcGIS falla o como respaldo para la calle
+    address_components = get_address_components_from_coords(geom)
+    calle = address_components["street"]
+
+    # Si el municipio de ArcGIS falló o no estaba disponible, usamos el de la geocodificación
+    if municipio_final == "ubicació desconeguda" or not municipio_arcgis:
+        municipio_final = address_components["municipality"] if address_components["municipality"] else "ubicació desconeguda"
+
 
     hora = datetime.fromtimestamp(a["ACT_DAT_ACTUACIO"]/1000, tz=timezone.utc)\
                .astimezone(ZoneInfo("Europe/Madrid")).strftime("%H:%M")
     
     location_str = ""
-    if calle:
-        # Si tenemos calle, la combinamos con el municipio (que siempre deberíamos tener de ArcGIS)
-        location_str = f"{calle}, {municipio}"
+    if calle and municipio_final != "ubicació desconeguda":
+        location_str = f"{calle}, {municipio_final}"
+    elif municipio_final != "ubicació desconeguda":
+        location_str = municipio_final
+    elif calle: # Si solo tenemos calle y el municipio es "desconocido"
+        location_str = calle
     else:
-        # Si no pudimos obtener la calle, usamos solo el municipio
-        location_str = municipio
-    
-    # Si al final la ubicación sigue siendo 'desconocida', es que ni ArcGIS ni geocodificador lo dieron
-    if location_str.lower() == "ubicació desconeguda" and not calle:
         location_str = "ubicació desconeguda"
 
     return (f"🔥 Incendi {classify(a)} a {location_str}\n"
@@ -172,17 +231,14 @@ def main():
     ]
     
     # La intervención más reciente de todas las nuevas (sin importar dotaciones o fase)
-    first_new_overall = next((f for f in feats if f["attributes"]["ESRI_OID"] > last_id), None)
+    most_recent_feature = next((f for f in feats if f["attributes"]["ESRI_OID"] > last_id), None)
 
     intervenciones_para_tweet = []
 
-    # 1. Identificar la actuación más reciente (de todas las nuevas)
-    most_recent_feature = None
-    if first_new_overall:
-        most_recent_feature = first_new_overall
+    if most_recent_feature:
         intervenciones_para_tweet.append({"title": "Actuació més recent", "feature": most_recent_feature})
 
-    # 2. Identificar la actuación más relevante (cumpliendo criterios de dotaciones/fase)
+    # Identificar la actuación más relevante (cumpliendo criterios de dotaciones/fase)
     # y que NO sea la misma que la más reciente si ya la incluimos
     most_relevant_feature = None
     if candidatos_activos:
@@ -194,7 +250,6 @@ def main():
                 -f["attributes"]["ACT_DAT_ACTUACIO"]
             )
         )
-        # La primera de esta lista es la más relevante
         potential_relevant = candidatos_activos[0]
 
         # Solo la añadimos si no es la misma que la "más reciente"
@@ -202,17 +257,10 @@ def main():
             most_relevant_feature = potential_relevant
             intervenciones_para_tweet.append({"title": "Incendi més rellevant", "feature": most_relevant_feature})
     
-    # Si tenemos dos intervenciones, aseguramos el orden: la más reciente primero, luego la más relevante.
-    # Necesitamos una forma robusta de ordenar si ambas existen.
-    # El orden en `intervenciones_para_tweet` ya debería reflejarlo si `most_recent_feature` se añade primero.
-    # Si solo hay una, simplemente se añade.
-
-    # Si por alguna razón la "más relevante" se añade antes, o queremos forzar el orden final:
-    # reordenar si ambas están presentes
+    # Asegurar el orden final: "Actuació més recent" siempre primero si ambas existen
     if len(intervenciones_para_tweet) == 2:
-        # Aseguramos que "Actuació més recent" vaya primero y "Incendi més rellevant" segundo
         if intervenciones_para_tweet[0]["title"] == "Incendi més rellevant":
-            intervenciones_para_tweet.reverse() # Invertir el orden si la relevante está primera
+            intervenciones_para_tweet.reverse() 
 
     if not intervenciones_para_tweet:
         logging.info("No hay intervenciones nuevas para tuitear.")
