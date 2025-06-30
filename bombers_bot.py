@@ -2,14 +2,13 @@
 """
 bombers_bot.py
 
-Publica (o simula) las intervenciones más relevantes de Bombers
-priorizando fase “actiu”, nº dotacions y tipo d'incendi.
+Publica (o simula) las intervenciones de Bombers priorizando:
+1) fase “actiu” (o sin fase)   2) nº dotacions  3) tipo (forestal > agrícola > urbà).
 
 Requisitos:
-    requests  geopy  tweepy>=4.0.0  pyproj
+    requests   geopy   tweepy>=4.0.0   pyproj
 """
 
-#!/usr/bin/env python3
 import os, json, logging, requests, tweepy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,9 +16,10 @@ from zoneinfo import ZoneInfo
 from geopy.geocoders import Nominatim
 from pyproj import Transformer
 
+# ---------------- CONFIG ------------------------------------------------
 LAYER_URL = ("https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
              "ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0")
-MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "3"))
+MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "3"))        # mínimo dotacions
 IS_TEST_MODE  = os.getenv("IS_TEST_MODE", "true").lower() == "true"
 API_KEY       = os.getenv("ARCGIS_API_KEY", "")
 MAPA_OFICIAL  = "https://interior.gencat.cat/ca/arees_dactuacio/bombers/actuacions-de-bombers/"
@@ -38,11 +38,14 @@ TW_KEYS = {
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 
-# ---------- estado ----------
-def load_state(): return json.loads(STATE_FILE.read_text())["last_id"] if STATE_FILE.exists() else -1
-def save_state(i): STATE_FILE.write_text(json.dumps({"last_id": i}))
+# ---------------- ESTADO -----------------------------------------------
+def load_state() -> int:
+    return json.loads(STATE_FILE.read_text()).get("last_id", -1) if STATE_FILE.exists() else -1
 
-# ---------- ArcGIS ----------
+def save_state(last_id: int):
+    STATE_FILE.write_text(json.dumps({"last_id": last_id}))
+
+# ---------------- CONSULTA ARCGIS --------------------------------------
 def fetch_features(limit=100):
     params = {
         "f": "json",
@@ -51,7 +54,7 @@ def fetch_features(limit=100):
             "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
             "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2"
         ),
-        "orderByFields": "ACT_DAT_ACTUACIO DESC",  # ← corrección
+        "orderByFields": "ACT_DAT_ACTUACIO DESC",  # espacio, no %20
         "resultRecordCount": limit,
         "returnGeometry": "true",
         "cacheHint": "true",
@@ -65,68 +68,97 @@ def fetch_features(limit=100):
         return []
     return data.get("features", [])
 
-# ---------- utilidades ----------
+# ---------------- UTILIDADES -------------------------------------------
 def tipo_val(a):
     d = (a.get("TAL_DESC_ALARMA1","")+" "+a.get("TAL_DESC_ALARMA2","")).lower()
     return 1 if "forestal" in d or "vegetació" in d else (2 if "agrí" in d else 3)
-def classify(a): return {1:"forestal",2:"agrícola",3:"urbà"}[tipo_val(a)]
-def utm_to_latlon(x,y): lon,lat=TRANSFORM.transform(x,y); return lat,lon
-def place(a, geom):
+
+def classify(a): return {1:"forestal", 2:"agrícola", 3:"urbà"}[tipo_val(a)]
+
+def utm_to_latlon(x, y):
+    lon, lat = TRANSFORM.transform(x, y)
+    return lat, lon
+
+def place_from_geom(a, geom):
     if geom:
-        lat,lon=utm_to_latlon(geom["x"],geom["y"])
+        lat, lon = utm_to_latlon(geom["x"], geom["y"])
         try:
-            loc=GEOCODER.reverse((lat,lon),exactly_one=True,timeout=8,language="ca")
-            if loc: return loc.address.split(",")[0]
-        except Exception: pass
+            loc = GEOCODER.reverse((lat, lon), exactly_one=True, timeout=8, language="ca")
+            if loc:
+                return loc.address.split(",")[0]
+        except Exception:
+            pass
     return "ubicació desconeguda"
-def cuerpo(a,p):
-    hora=datetime.fromtimestamp(a["ACT_DAT_ACTUACIO"]/1000,tz=timezone.utc)\
-         .astimezone(ZoneInfo("Europe/Madrid")).strftime("%H:%M")
-    return (f"🔥 Incendi {classify(a)} a {p}\n"
-            f"🕒 {hora}  |  🚒 {a['ACT_NUM_VEH']} dotacions treballant\n{MAPA_OFICIAL}")
-def enviar(txt,api):
-    print("TUIT SIMULADO:\n"+txt+"\n") if IS_TEST_MODE else api.update_status(txt)
 
-# ---------- main ----------
-def main():
-    api=None
-    if not IS_TEST_MODE and all(TW_KEYS.values()):
-        auth=tweepy.OAuth1UserHandler(TW_KEYS["ck"],TW_KEYS["cs"],TW_KEYS["at"],TW_KEYS["as"])
-        api=tweepy.API(auth)
+def tweet_body(a, place):
+    hora = datetime.fromtimestamp(a["ACT_DAT_ACTUACIO"]/1000, tz=timezone.utc)\
+           .astimezone(ZoneInfo("Europe/Madrid")).strftime("%H:%M")
+    return (f"🔥 Incendi {classify(a)} a {place}\n"
+            f"🕒 {hora}  |  🚒 {a['ACT_NUM_VEH']} dotacions treballant\n"
+            f"{MAPA_OFICIAL}")
 
-    last_id=load_state()
-    feats=fetch_features()
-    if not feats: return
-
-    # candidatos activos y con dotacions
-    candidatos=[f for f in feats if (
-        f["attributes"]["ACT_NUM_VEH"]>=MIN_DOTACIONS and
-        f["attributes"]["COM_FASE"].lower() in ("","actiu") and
-        f["attributes"]["ESRI_OID"]>last_id)]
-    candidatos.sort(key=lambda f:(-f["attributes"]["ACT_NUM_VEH"],
-                                  tipo_val(f["attributes"]),
-                                  -f["attributes"]["ACT_DAT_ACTUACIO"]))
-
-    tweets=[]
-    if candidatos:
-        tweets.append(candidatos[0])
-        # segundo tweet (distinto ID) si hay otro
-        for f in candidatos[1:]:
-            if f["attributes"]["ESRI_OID"]!=tweets[0]["attributes"]["ESRI_OID"]:
-                tweets.append(f); break
+def send(text, api):
+    if IS_TEST_MODE:
+        print("TUIT SIMULADO:\n" + text + "\n")
     else:
-        # fallback: solo el más reciente global
-        first_new=next((f for f in feats if f["attributes"]["ESRI_OID"]>last_id), None)
-        if first_new: tweets.append(first_new)
+        api.update_status(text)
 
-    max_id=last_id
+# ---------------- MAIN --------------------------------------------------
+def main():
+    # Twitter API (solo producción)
+    api = None
+    if not IS_TEST_MODE and all(TW_KEYS.values()):
+        auth = tweepy.OAuth1UserHandler(TW_KEYS["ck"], TW_KEYS["cs"], TW_KEYS["at"], TW_KEYS["as"])
+        api = tweepy.API(auth)
+
+    last_id = load_state()
+    feats = fetch_features()
+    if not feats:
+        logging.info("ArcGIS devolvió 0 features.")
+        return
+
+    # candidatos activos con dotacions >= mínimo
+    candidatos = [
+        f for f in feats
+        if f["attributes"]["ACT_NUM_VEH"] >= MIN_DOTACIONS
+           and (str(f["attributes"].get("COM_FASE") or "")).lower() in ("", "actiu")
+           and f["attributes"]["ESRI_OID"] > last_id
+    ]
+    candidatos.sort(
+        key=lambda f: (
+            -f["attributes"]["ACT_NUM_VEH"],
+            tipo_val(f["attributes"]),
+            -f["attributes"]["ACT_DAT_ACTUACIO"]
+        )
+    )
+
+    tweets = []
+
+    if candidatos:
+        tweets.append(candidatos[0])                # principal
+        # posible segundo tweet
+        for f in candidatos[1:]:
+            if f["attributes"]["ESRI_OID"] != tweets[0]["attributes"]["ESRI_OID"]:
+                tweets.append(f)
+                break
+    else:
+        # fallback: la intervención más reciente no procesada
+        first_new = next((f for f in feats if f["attributes"]["ESRI_OID"] > last_id), None)
+        if first_new:
+            tweets.append(first_new)
+
+    if not tweets:
+        logging.info("No hay intervenciones nuevas para tuitear.")
+        return
+
+    max_id = last_id
     for f in tweets:
-        a=f["attributes"]; p=place(a,f.get("geometry"))
-        enviar(cuerpo(a,p),api)
-        max_id=max(max_id,a["ESRI_OID"])
+        a = f["attributes"]
+        body = tweet_body(a, place_from_geom(a, f.get("geometry")))
+        send(body, api)
+        max_id = max(max_id, a["ESRI_OID"])
 
     save_state(max_id)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
-
