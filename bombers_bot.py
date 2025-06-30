@@ -2,11 +2,12 @@
 """
 bombers_bot.py
 
-Consulta la capa ArcGIS “ACTUACIONS URGENTS online PRO” de Bombers
-y publica (o simula) tuits con las intervenciones más recientes.
+Consulta la capa ArcGIS de Bombers de la Generalitat
+y publica un tuit conjunto con:
+- L’actuació més recent
+- L’incendi actiu més rellevant (≥ MIN_DOTACIONS)
 
-Dependencias:
-    requests, geopy, tweepy, pyproj
+Dependencias: requests, geopy, tweepy, pyproj
 """
 
 import os
@@ -32,21 +33,15 @@ IS_TEST_MODE = os.getenv("IS_TEST_MODE", "true").lower() == "true"
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "bombers_bot")
 API_KEY = os.getenv("ARCGIS_API_KEY")
 
-STATE_FILE = Path("state.json")
-
 TW_CONSUMER_KEY = os.getenv("TW_CONSUMER_KEY")
 TW_CONSUMER_SECRET = os.getenv("TW_CONSUMER_SECRET")
 TW_ACCESS_TOKEN = os.getenv("TW_ACCESS_TOKEN")
 TW_ACCESS_SECRET = os.getenv("TW_ACCESS_SECRET")
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# --------------- TRANSFORMADOR UTM ➜ WGS‑84 -----------------------------
 transformer = Transformer.from_crs(25831, 4326, always_xy=True)
-
-# --------------- GEOCODING ----------------------------------------------
-GEOCODER = Nominatim(user_agent=GEOCODER_USER_AGENT)
+geocoder = Nominatim(user_agent=GEOCODER_USER_AGENT)
 
 def utm_to_latlon(x, y):
     lon, lat = transformer.transform(x, y)
@@ -57,7 +52,7 @@ def place_from_geom(a, geom):
     if geom:
         lat, lon = utm_to_latlon(geom["x"], geom["y"])
         try:
-            loc = GEOCODER.reverse((lat, lon), exactly_one=True, timeout=8, language="ca")
+            loc = geocoder.reverse((lat, lon), exactly_one=True, timeout=8, language="ca")
             if loc:
                 adr = loc.raw.get("address", {})
                 road = adr.get("road") or adr.get("pedestrian") or adr.get("footway") or adr.get("path")
@@ -76,14 +71,6 @@ def place_from_geom(a, geom):
             logging.warning(f"Reverse geocode error: {e}")
     return nom_municipi or "ubicació desconeguda"
 
-# --------------- FORMATO Y PUBLICACIÓN ---------------------------------
-def format_tweet(a, lloc, tipus):
-    hora = datetime.utcfromtimestamp(a["ACT_DAT_ACTUACIO"] / 1000).replace(
-        tzinfo=timezone.utc).astimezone(ZoneInfo("Europe/Madrid")).strftime("%H:%M")
-    n = a.get("ACT_NUM_VEH", "?")
-    url = "https://interior.gencat.cat/ca/arees_dactuacio/bombers/actuacions-de-bombers/"
-    return f"🔥 Incendi {tipus} a {lloc}\n🕒 {hora}  |  🚒 {n} dotacions treballant\n{url}"
-
 def classify(a):
     t1 = (a.get("TAL_DESC_ALARMA1") or "").lower()
     t2 = (a.get("TAL_DESC_ALARMA2") or "").lower()
@@ -96,13 +83,29 @@ def classify(a):
         return "forestal"
     return "forestal"
 
+def hora_str(epoch_ms):
+    dt = datetime.utcfromtimestamp(epoch_ms / 1000).replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZoneInfo("Europe/Madrid")).strftime("%H:%M")
+
+def format_intervencio(a, lloc, tipus):
+    hora = hora_str(a["ACT_DAT_ACTUACIO"])
+    n = a.get("ACT_NUM_VEH", "?")
+    return f"🔥 Incendi {tipus} a {lloc}\n🕒 {hora}  |  🚒 {n} dotacions treballant"
+
+def format_tweet(combinat1, combinat2=None):
+    url = "https://interior.gencat.cat/ca/arees_dactuacio/bombers/actuacions-de-bombers/"
+    text = f"🔥 Incendi actiu més rellevant:\n{combinat1}"
+    if combinat2:
+        text += f"\n\n🔥 Actuació més recent:\n{combinat2}"
+    text += f"\n{url}"
+    return text
+
 def tweet(text, api):
     if IS_TEST_MODE:
-        print("TUIT SIMULADO:\n" + text)
+        print("TUIT SIMULAT:\n" + text)
     else:
         api.update_status(text)
 
-# --------------- CONSULTA A ARCGIS --------------------------------------
 def fetch_features():
     url = f"{LAYER_URL}/query"
     params = {
@@ -127,11 +130,8 @@ def fetch_features():
         raise Exception(f"ArcGIS error {data['error'].get('code')}: {data['error'].get('message')}")
     return data.get("features", [])
 
-# --------------- MAIN --------------------------------------------------
 def main():
-    last_id = -1
-    logging.info("Último ESRI_OID procesado: %s", last_id)
-
+    logging.info("Consultando intervenciones...")
     api = None
     if not IS_TEST_MODE:
         if not all([TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]):
@@ -146,41 +146,27 @@ def main():
         logging.error(f"Error al consultar ArcGIS: {e}")
         return
 
-    logging.info("Consulta URL: %s/query?...", LAYER_URL)
-    logging.info("Número de features recibidos: %s", len(feats))
-    if not feats:
-        logging.info("No se encontraron intervenciones.")
+    activos = [f for f in feats if f["attributes"].get("COM_FASE", "").lower() in ("", "actiu")]
+    if not activos:
+        logging.info("No hay intervenciones activas.")
         return
 
-    candidatos = [
-        f for f in feats
-        if f["attributes"].get("COM_FASE", "").lower() in ("", "actiu")
-    ]
+    rellevant = next((f for f in activos if f["attributes"].get("ACT_NUM_VEH", 0) >= MIN_DOTACIONS), None)
+    recent = activos[0]  # primera por orden DESC
 
-    if not candidatos:
-        logging.info("No hay intervenciones en fase activa o sin fase.")
-        return
+    a1 = rellevant or recent
+    g1 = a1.get("geometry")
+    txt1 = format_intervencio(a1["attributes"], place_from_geom(a1["attributes"], g1), classify(a1["attributes"]))
 
-    tuit = None
-    prioritaria = None
-    for f in candidatos:
-        a = f["attributes"]
-        if a["ACT_NUM_VEH"] >= MIN_DOTACIONS:
-            prioritaria = f
-            break
+    txt2 = None
+    if rellevant and recent and rellevant != recent:
+        a2 = recent
+        g2 = a2.get("geometry")
+        txt2 = format_intervencio(a2["attributes"], place_from_geom(a2["attributes"], g2), classify(a2["attributes"]))
 
-    if prioritaria:
-        a = prioritaria["attributes"]
-        lloc = place_from_geom(a, prioritaria.get("geometry"))
-        tipus = classify(a)
-        tuit = format_tweet(a, lloc, tipus)
-    else:
-        a = candidatos[0]["attributes"]
-        lloc = place_from_geom(a, candidatos[0].get("geometry"))
-        tipus = classify(a)
-        tuit = format_tweet(a, lloc, tipus)
-
-    tweet(tuit, api)
+    text = format_tweet(txt1, txt2)
+    tweet(text, api)
 
 if __name__ == "__main__":
     main()
+
