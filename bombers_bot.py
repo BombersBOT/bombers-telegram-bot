@@ -22,7 +22,7 @@ from urllib3.util.retry import Retry
 LAYER_URL = ("https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
              "ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0")
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "3"))     # mínimo dotacions
-IS_TEST_MODE  = os.getenv("IS_TEST_MODE", "true").lower() == "true"
+IS_TEST_MODE  = os.getenv("IS_TEST_MODE", "false").lower() == "false"
 API_KEY       = os.getenv("ARCGIS_API_KEY", "")
 MAPA_OFICIAL  = "https://interior.gencat.cat/ca/arees_dactuacio/bombers/actuacions-de-bombers/"
 
