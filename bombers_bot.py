@@ -4,12 +4,6 @@ bombers_bot.py
 
 Consulta la capa ArcGIS “ACTUACIONS URGENTS online PRO” de Bombers
 y publica (o simula) tuits con las intervenciones más recientes y relevantes.
-
-Dependencias (requirements.txt):
-    requests
-    geopy
-    tweepy>=4.0.0
-    pyproj
 """
 
 import os
@@ -33,7 +27,7 @@ LAYER_URL = os.getenv(
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
 IS_TEST_MODE = os.getenv("IS_TEST_MODE", "true").lower() == "true"
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "bombers_bot")
-API_KEY = os.getenv("ARCGIS_API_KEY")  # tu token API aquí
+API_KEY = os.getenv("ARCGIS_API_KEY")  # si tienes
 
 STATE_FILE = Path("state.json")
 
@@ -64,11 +58,14 @@ def query_features():
         "where": "1=1",
         "outFields": "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM",
         "orderByFields": "ACT_DAT_ACTUACIO DESC",
-        "resultRecordCount": 100,
+        "resultRecordCount": 50,  # limitar para no pedir 100+
         "returnGeometry": "true",
+        "cacheHint": "true",
     }
     if API_KEY:
         params["token"] = API_KEY
+
+    logging.info(f"Consulta URL: {url}?{requests.compat.urlencode(params)}")
 
     try:
         r = requests.get(url, params=params, timeout=15)
@@ -126,15 +123,9 @@ def format_place(attrs, lat, lon):
     place = None
     if lat and lon:
         place = reverse_geocode(lat, lon)
-    # Si reverse geocode falla, intentar usar municipio de ArcGIS
     if not place:
-        road = None
-        # Intentamos conservar calle si está
-        try:
-            # El lugar puede estar en el atributo TAL_DESC_ALARMA2 o TAL_DESC_ALARMA1 (texto)
-            road = attrs.get("TAL_DESC_ALARMA2") or attrs.get("TAL_DESC_ALARMA1")
-        except Exception:
-            road = None
+        # Si reverse geocode falla, usar municipio de ArcGIS, y calle si hay
+        road = attrs.get("TAL_DESC_ALARMA2") or attrs.get("TAL_DESC_ALARMA1") or None
         municipio = attrs.get("MUN_NOM")
         if municipio and road:
             place = f"{road}, {municipio}"
@@ -183,7 +174,7 @@ def main():
     candidatos = [
         f for f in feats
         if f["attributes"].get("ESRI_OID", 0) > last_id
-        and f["attributes"].get("COM_FASE", "").lower() in ("", "actiu")
+        and (f["attributes"].get("COM_FASE") or "").lower() in ("", "actiu")
     ]
 
     if not candidatos:
@@ -200,7 +191,6 @@ def main():
         None
     )
 
-    # Preparar texto del tweet con ambos casos
     partes_tweet = []
 
     def formatear_intervencion(feat, titulo):
@@ -223,7 +213,6 @@ def main():
     tweet_text = "\n\n".join(partes_tweet)
     tweet(tweet_text, api)
 
-    # Guardar estado con el ESRI_OID de la intervención más reciente procesada
     save_state({"last_id": mas_reciente["attributes"]["ESRI_OID"]})
 
 if __name__ == "__main__":
