@@ -52,7 +52,7 @@ def fetch_features(limit=100):
         "where": "1=1",
         "outFields": (
             "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
-            "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM_MUNICIPI,VIAL_NOM_CARRER"
+            "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2" # Vuelven los campos originales aquí
         ),
         "orderByFields": "ACT_DAT_ACTUACIO DESC",  # espacio, no %20
         "resultRecordCount": limit,
@@ -79,32 +79,49 @@ def utm_to_latlon(x, y):
     lon, lat = TRANSFORM.transform(x, y)
     return lat, lon
 
-def get_street_from_coords(geom):
+def get_full_address_from_coords(geom):
     if geom:
         lat, lon = utm_to_latlon(geom["x"], geom["y"])
         try:
             loc = GEOCODER.reverse((lat, lon), exactly_one=True, timeout=8, language="ca")
             if loc and loc.address:
-                # Attempt to extract street name (first part of address before a comma or number)
-                parts = loc.address.split(',')[0].strip().split(' ')
-                street_name = []
-                for part in parts:
-                    if any(char.isdigit() for char in part):
-                        break
-                    street_name.append(part)
-                return " ".join(street_name) if street_name else ""
+                return loc.address
         except Exception:
             pass
-    return ""
+    return "ubicació desconeguda"
 
 def format_intervention(a, geom):
-    municipio = a.get("MUN_NOM_MUNICIPI", "desconegut")
-    calle = get_street_from_coords(geom)
+    full_address = get_full_address_from_coords(geom)
+    
+    # Intentamos extraer solo la calle y el municipio de la dirección completa
+    parts = [part.strip() for part in full_address.split(',')]
+    
+    # La calle suele ser la primera parte, y el municipio una de las siguientes
+    street = ""
+    municipality = ""
+
+    if parts:
+        street = parts[0] # Asumimos que la primera parte es la calle o lo más cercano
+        # Buscamos un posible municipio en las siguientes partes
+        for part in parts[1:]:
+            # Simple heurística: los municipios suelen ser palabras individuales
+            # o combinaciones sin números y que suenen a lugar
+            if not any(char.isdigit() for char in part) and len(part) > 2:
+                municipality = part
+                break
+
+    location_str = ""
+    if street != "ubicació desconeguda": # Si la calle no es la cadena de "ubicació desconeguda"
+        location_str = street
+        if municipality and municipality != street: # Aseguramos que el municipio no sea lo mismo que la calle si ya la tenemos
+             location_str = f"{street}, {municipality}"
+    elif municipality: # Si no tenemos calle pero sí municipio
+        location_str = municipality
+    else: # Si no tenemos ni calle ni municipio de la geocodificación
+        location_str = "ubicació desconeguda"
 
     hora = datetime.fromtimestamp(a["ACT_DAT_ACTUACIO"]/1000, tz=timezone.utc)\
                .astimezone(ZoneInfo("Europe/Madrid")).strftime("%H:%M")
-    
-    location_str = f"{calle}, {municipio}" if calle else municipio
     
     return (f"🔥 Incendi {classify(a)} a {location_str}\n"
             f"🕒 {hora} | 🚒 {a['ACT_NUM_VEH']} dotacions treballant")
