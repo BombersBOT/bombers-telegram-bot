@@ -3,7 +3,7 @@
 bombers_bot.py
 
 Consulta la capa ArcGIS “ACTUACIONS URGENTS online PRO” de Bombers
-y publica (o simula) tuits con intervenciones relevantes.
+y publica (o simula) tuits con las intervenciones más recientes y relevantes.
 
 Dependencias (requirements.txt):
     requests
@@ -30,7 +30,7 @@ LAYER_URL = os.getenv(
     "https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
     "ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0"
 )
-MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "3"))  # Cambiado a 3 según petición
+MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "5"))
 IS_TEST_MODE = os.getenv("IS_TEST_MODE", "true").lower() == "true"
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "bombers_bot")
 API_KEY = os.getenv("ARCGIS_API_KEY")  # tu token API aquí
@@ -56,16 +56,13 @@ def save_state(state):
 # --------------- TRANSFORMADOR UTM ➜ WGS‑84 -----------------------------
 transformer = Transformer.from_crs(25831, 4326, always_xy=True)
 
-# --------------- ARC­GIS QUERY -------------------------------------------
+# --------------- ARC­GIS QUERY -----------------------------------------
 def query_features():
     url = f"{LAYER_URL}/query"
     params = {
         "f": "json",
         "where": "1=1",
-        "outFields": (
-            "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
-            "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUNICIPI_DPX"
-        ),
+        "outFields": "ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM",
         "orderByFields": "ACT_DAT_ACTUACIO DESC",
         "resultRecordCount": 100,
         "returnGeometry": "true",
@@ -77,9 +74,6 @@ def query_features():
         r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
-        if "error" in data:
-            logging.error(f"Error en respuesta ArcGIS: {data['error']}")
-            return []
         feats = data.get("features", [])
         logging.info(f"Recibidas {len(feats)} intervenciones desde ArcGIS.")
         for i, feat in enumerate(feats[:5]):
@@ -92,7 +86,7 @@ def query_features():
         logging.error(f"Error en consulta ArcGIS: {e}")
         return []
 
-# --------------- UTILIDADES ----------------------------------------------
+# --------------- UTILIDADES --------------------------------------------
 def classify_incident(attrs) -> str:
     desc = (attrs.get("TAL_DESC_ALARMA1", "") + " " + attrs.get("TAL_DESC_ALARMA2", "")).lower()
     if "urbà" in desc or "urbano" in desc:
@@ -109,35 +103,46 @@ def utm_to_latlon(x, y):
     lon, lat = transformer.transform(x, y)
     return lat, lon
 
-def place_from_geom(attrs, geom):
-    nom_municipi = attrs.get("MUNICIPI_DPX", "").title()
-    if geom:
-        lat, lon = utm_to_latlon(geom["x"], geom["y"])
+def reverse_geocode(lat, lon):
+    try:
+        loc = geocoder.reverse((lat, lon), exactly_one=True, timeout=10, language="ca")
+        if loc:
+            adr = loc.raw.get("address", {})
+            house = adr.get("house_number")
+            road = (adr.get("road") or adr.get("pedestrian") or adr.get("footway") or
+                    adr.get("cycleway") or adr.get("path"))
+            town = adr.get("town") or adr.get("village") or adr.get("municipality")
+            county = adr.get("county") or adr.get("state_district")
+            if road:
+                if house:
+                    return f"{road} {house}, {town or county}"
+                return f"{road}, {town or county}"
+            return f"{town or county}, {adr.get('state', '')}".strip(", ")
+    except Exception as e:
+        logging.warning(f"Reverse geocode error: {e}")
+    return None
+
+def format_place(attrs, lat, lon):
+    place = None
+    if lat and lon:
+        place = reverse_geocode(lat, lon)
+    # Si reverse geocode falla, intentar usar municipio de ArcGIS
+    if not place:
+        road = None
+        # Intentamos conservar calle si está
         try:
-            loc = geocoder.reverse((lat, lon), exactly_one=True, timeout=8, language="ca")
-            if loc:
-                adr = loc.raw.get("address", {})
-                road = adr.get("road") or adr.get("pedestrian") or adr.get("footway") or adr.get("path")
-                town = adr.get("town") or adr.get("village") or adr.get("municipality") or adr.get("city")
-                county = adr.get("county") or adr.get("state_district")
-
-                # Si hay calle y municipio detectado por geolocalización:
-                if road and (town or county):
-                    return f"{road}, {town or county}"
-                # Si hay calle pero no municipio detectado, usar municipio del ArcGIS
-                elif road and nom_municipi:
-                    return f"{road}, {nom_municipi}"
-                # Si no hay calle pero municipio detectado:
-                elif town or county:
-                    return f"{town or county}"
-                # Si no hay nada detectado, usar municipio ArcGIS
-                elif nom_municipi:
-                    return nom_municipi
-        except Exception as e:
-            logging.warning(f"Reverse geocode error: {e}")
-
-    # Si no hay geom o no se pudo geolocalizar:
-    return nom_municipi or "ubicació desconeguda"
+            # El lugar puede estar en el atributo TAL_DESC_ALARMA2 o TAL_DESC_ALARMA1 (texto)
+            road = attrs.get("TAL_DESC_ALARMA2") or attrs.get("TAL_DESC_ALARMA1")
+        except Exception:
+            road = None
+        municipio = attrs.get("MUN_NOM")
+        if municipio and road:
+            place = f"{road}, {municipio}"
+        elif municipio:
+            place = municipio
+        else:
+            place = "ubicació desconeguda"
+    return place
 
 def format_tweet(attrs, place, incident_type):
     dt_utc = datetime.utcfromtimestamp(attrs["ACT_DAT_ACTUACIO"] / 1000).replace(tzinfo=timezone.utc)
@@ -154,11 +159,11 @@ def tweet(text, api):
     else:
         api.update_status(text)
 
-# --------------- MAIN ----------------------------------------------------
+# --------------- MAIN --------------------------------------------------
 def main():
     logging.info("Consultando intervenciones...")
     state = load_state()
-    last_id = state.get("last_id", -1)
+    last_id = state["last_id"]
     logging.info(f"Último ESRI_OID procesado: {last_id}")
 
     api = None
@@ -166,7 +171,8 @@ def main():
         if not all([TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET]):
             logging.error("Faltan credenciales de Twitter.")
             return
-        auth = tweepy.OAuth1UserHandler(TW_CONSUMER_KEY, TW_CONSUMER_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET)
+        auth = tweepy.OAuth1UserHandler(TW_CONSUMER_KEY, TW_CONSUMER_SECRET,
+                                        TW_ACCESS_TOKEN, TW_ACCESS_SECRET)
         api = tweepy.API(auth)
 
     feats = query_features()
@@ -174,47 +180,51 @@ def main():
         logging.info("No hay intervenciones recibidas.")
         return
 
-    # Filtrar nuevas intervenciones, fase activa o sin fase
     candidatos = [
         f for f in feats
         if f["attributes"].get("ESRI_OID", 0) > last_id
-        and f["attributes"].get("COM_FASE", "") and f["attributes"]["COM_FASE"].lower() in ("", "actiu")
+        and f["attributes"].get("COM_FASE", "").lower() in ("", "actiu")
     ]
 
     if not candidatos:
         logging.info("No hay intervenciones nuevas y relevantes.")
         return
 
-    # Intervención más reciente (ordenado por ACT_DAT_ACTUACIO descendente)
-    candidatos.sort(key=lambda f: f["attributes"]["ACT_DAT_ACTUACIO"], reverse=True)
-    mas_reciente = candidatos[0]
+    # Más reciente (máximo ACT_DAT_ACTUACIO)
+    mas_reciente = max(candidatos, key=lambda f: f["attributes"].get("ACT_DAT_ACTUACIO", 0))
 
-    # Buscar otra con dotaciones >= MIN_DOTACIONS en fase actiu o sin fase, diferente de la más reciente
-    con_dotacions = [f for f in candidatos if f["attributes"].get("ACT_NUM_VEH", 0) >= MIN_DOTACIONS and f != mas_reciente]
-    con_dotacions = sorted(con_dotacions, key=lambda f: f["attributes"]["ACT_DAT_ACTUACIO"], reverse=True)
-    mas_relevante = con_dotacions[0] if con_dotacions else None
+    # Intervención con dotaciones >= MIN_DOTACIONS y fase "actiu" o sin fase
+    con_mas_dotaciones = next(
+        (f for f in candidatos
+         if f["attributes"].get("ACT_NUM_VEH", 0) >= MIN_DOTACIONS),
+        None
+    )
 
-    # Formatear texto único para tweet con ambas intervenciones
-    tweet_text = ""
+    # Preparar texto del tweet con ambos casos
+    partes_tweet = []
 
-    attrs = mas_reciente["attributes"]
-    geom = mas_reciente.get("geometry")
-    place = place_from_geom(attrs, geom)
-    incident_type = classify_incident(attrs)
-    tweet_text += f"🆕 Actuació més recent:\n{format_tweet(attrs, place, incident_type)}\n\n"
-
-    if mas_relevante:
-        attrs = mas_relevante["attributes"]
-        geom = mas_relevante.get("geometry")
-        place = place_from_geom(attrs, geom)
+    def formatear_intervencion(feat, titulo):
+        attrs = feat["attributes"]
+        geom = feat.get("geometry")
+        if geom:
+            lat, lon = utm_to_latlon(geom["x"], geom["y"])
+        else:
+            lat = lon = None
+        place = format_place(attrs, lat, lon)
         incident_type = classify_incident(attrs)
-        tweet_text += f"🔥 Incendi actiu més rellevant:\n{format_tweet(attrs, place, incident_type)}"
+        texto = format_tweet(attrs, place, incident_type)
+        return f"{titulo}:\n{texto}"
 
-    if not IS_TEST_MODE:
-        tweet(tweet_text, api)
-        save_state({"last_id": mas_reciente["attributes"]["ESRI_OID"]})
-    else:
-        print("TUIT SIMULADO:\n" + tweet_text)
+    partes_tweet.append(formatear_intervencion(mas_reciente, "Actuació més recent"))
+
+    if con_mas_dotaciones and con_mas_dotaciones["attributes"]["ESRI_OID"] != mas_reciente["attributes"]["ESRI_OID"]:
+        partes_tweet.append(formatear_intervencion(con_mas_dotaciones, "Incendi actiu més rellevant"))
+
+    tweet_text = "\n\n".join(partes_tweet)
+    tweet(tweet_text, api)
+
+    # Guardar estado con el ESRI_OID de la intervención más reciente procesada
+    save_state({"last_id": mas_reciente["attributes"]["ESRI_OID"]})
 
 if __name__ == "__main__":
     main()
