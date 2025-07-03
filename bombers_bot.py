@@ -80,13 +80,11 @@ def fetch_features(limit=100):
         return []
     except requests.exceptions.RequestException as e:
         logging.error(f"Error de conexión al consultar ArcGIS: {e}")
-        # Si hay un error general de request, intentamos el fallback por si es el MUN_NOM_MUNICIPI
         if "400" in str(e) and "Invalid query parameters" in str(e):
              logging.warning("Error 400 al obtener MUN_NOM_MUNICIPI. Intentando sin él.")
         else:
              logging.warning("Error de ArcGIS, pero no el esperado con MUN_NOM_MUNICIPI. Reintentando consulta básica.")
         
-        # Fallback si falla la consulta con MUN_NOM_MUNICIPI
         params["outFields"] = ("ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
                                "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
         try:
@@ -96,7 +94,6 @@ def fetch_features(limit=100):
             if "error" in data:
                 logging.error("Fallback ArcGIS error %s: %s", data["error"]["code"], data["error"]["message"])
                 return []
-            # Añadimos un marcador para saber que el municipio no vino de ArcGIS
             for feature in data.get("features", []):
                 feature["attributes"]["_municipio_from_arcgis_success"] = False
             return data.get("features", [])
@@ -107,8 +104,6 @@ def fetch_features(limit=100):
     data = r.json()
     if "error" in data:
         logging.error("ArcGIS error %s: %s", data["error"]["code"], data["error"]["message"])
-        # Si el error es específico de parámetros y veníamos de una consulta con MUN_NOM_MUNICIPI,
-        # intentamos el fallback aquí también, si no se hizo antes.
         if data["error"]["code"] == 400 and "Invalid query parameters" in data["error"]["message"]:
             logging.warning("Error 400 al obtener MUN_NOM_MUNICIPI. Intentando sin él.")
             params["outFields"] = ("ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
@@ -136,13 +131,17 @@ def fetch_features(limit=100):
 # ---------------- UTILIDADES -------------------------------------------
 def tipo_val(a):
     d = (a.get("TAL_DESC_ALARMA1","")+" "+a.get("TAL_DESC_ALARMA2","")).lower()
-    # MODIFICACIÓN AQUI: Priorizar "agrícola" sobre "vegetación"
-    if "agrí" in d:         # Detectar "agrícola" (por "agrí" en "agrícola", "agrícoles", etc.)
-        return 2            # Tipo: agrícola
-    elif "forestal" in d or "vegetació" in d: # Luego, si es "forestal" o "vegetación" (que no sea agrícola)
-        return 1            # Tipo: forestal
-    else:                   # Si no encaja en las anteriores
-        return 3            # Tipo: urbano
+    
+    # --- MODIFICACIÓN AQUI: Priorizar "urbà/urbana" sobre "vegetació" ---
+    if "urbà" in d or "urbana" in d:
+        return 3 # Esto es "urbà"
+    # --- FIN MODIFICACIÓN ---
+    elif "agrí" in d:         # Priorizar agrícola
+        return 2            # Esto es "agrícola"
+    elif "forestal" in d or "vegetació" in d: # Luego, si es forestal o solo vegetación
+        return 1            # Esto es "forestal"
+    else:                   # Cualquier otra cosa
+        return 3            # Esto es "urbà" por defecto
 
 def classify(a):
     return {1: "forestal", 2: "agrícola", 3: "urbà"}[tipo_val(a)]
@@ -263,7 +262,6 @@ def main():
     # Filtra solo las nuevas intervenciones (por ESRI_OID)
     new_feats = [f for f in feats if f["attributes"]["ESRI_OID"] > last_id]
 
-    # La intervención más reciente de todas las nuevas
     most_recent_feature = None
     if new_feats:
         # Ordenar por fecha de actuación para encontrar la más reciente entre todas las nuevas
