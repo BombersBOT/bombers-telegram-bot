@@ -1,7 +1,7 @@
 name: Ejecutar bot Bombers
 
 on:
-  workflow_dispatch:         # Permite ejecutarlo manualmente desde GitHub
+  workflow_dispatch:        # Permite ejecutarlo manualmente desde GitHub
 
 jobs:
   run-bot:
@@ -27,6 +27,5 @@ jobs:
           TW_ACCESS_SECRET: ${{ secrets.TW_ACCESS_SECRET }}
           MIN_DOTACIONS: "5"
           GEOCODER_USER_AGENT: bombers_bot_1.0
+          IS_TEST_MODE: "false" # <-- Configurado para publicar tweets reales
         run: python bombers_bot.py
-
-
