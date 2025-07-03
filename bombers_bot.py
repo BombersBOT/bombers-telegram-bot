@@ -22,7 +22,9 @@ from urllib3.util.retry import Retry
 LAYER_URL = ("https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
              "ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0")
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "3"))     # mínimo dotacions
-IS_TEST_MODE  = os.getenv("IS_TEST_MODE", "false").lower() == "false"
+# IS_TEST_MODE se establece a True por defecto (simulación)
+# Para publicar en real, la variable de entorno IS_TEST_MODE debe ser "false"
+IS_TEST_MODE  = os.getenv("IS_TEST_MODE", "true").lower() == "true"
 API_KEY       = os.getenv("ARCGIS_API_KEY", "")
 MAPA_OFICIAL  = "https://interior.gencat.cat/ca/arees_dactuacio/bombers/actuacions-de-bombers/"
 
@@ -41,7 +43,6 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 
 # Configuración de reintentos para requests
-# Aumentamos el backoff_factor para dar más tiempo al servidor de ArcGIS si está saturado.
 retries = Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503, 504])
 session = requests.Session()
 session.mount('https://', HTTPAdapter(max_retries=retries))
@@ -80,7 +81,7 @@ def fetch_features(limit=100):
     except requests.exceptions.RequestException as e:
         logging.error(f"Error de conexión al consultar ArcGIS: {e}")
         # Si hay un error general de request, intentamos el fallback por si es el MUN_NOM_MUNICIPI
-        if "400" in str(e) and "Invalid query parameters" in str(e): # Captura específica del error 400
+        if "400" in str(e) and "Invalid query parameters" in str(e):
              logging.warning("Error 400 al obtener MUN_NOM_MUNICIPI. Intentando sin él.")
         else:
              logging.warning("Error de ArcGIS, pero no el esperado con MUN_NOM_MUNICIPI. Reintentando consulta básica.")
@@ -97,7 +98,7 @@ def fetch_features(limit=100):
                 return []
             # Añadimos un marcador para saber que el municipio no vino de ArcGIS
             for feature in data.get("features", []):
-                feature["attributes"]["_municipio_from_arcgis_success"] = False # Renombrado a privado
+                feature["attributes"]["_municipio_from_arcgis_success"] = False
             return data.get("features", [])
         except requests.exceptions.RequestException as e_fallback:
             logging.error(f"Error en fallback de ArcGIS: {e_fallback}")
@@ -127,7 +128,6 @@ def fetch_features(limit=100):
                 return []
         return []
     
-    # Marcador para saber que el municipio SÍ vino de ArcGIS
     for feature in data.get("features", []):
         feature["attributes"]["_municipio_from_arcgis_success"] = True
     return data.get("features", [])
@@ -136,9 +136,16 @@ def fetch_features(limit=100):
 # ---------------- UTILIDADES -------------------------------------------
 def tipo_val(a):
     d = (a.get("TAL_DESC_ALARMA1","")+" "+a.get("TAL_DESC_ALARMA2","")).lower()
-    return 1 if "forestal" in d or "vegetació" in d else (2 if "agrí" in d else 3)
+    # MODIFICACIÓN AQUI: Priorizar "agrícola" sobre "vegetación"
+    if "agrí" in d:         # Detectar "agrícola" (por "agrí" en "agrícola", "agrícoles", etc.)
+        return 2            # Tipo: agrícola
+    elif "forestal" in d or "vegetació" in d: # Luego, si es "forestal" o "vegetación" (que no sea agrícola)
+        return 1            # Tipo: forestal
+    else:                   # Si no encaja en las anteriores
+        return 3            # Tipo: urbano
 
-def classify(a): return {1:"forestal", 2:"agrícola", 3:"urbà"}[tipo_val(a)]
+def classify(a):
+    return {1: "forestal", 2: "agrícola", 3: "urbà"}[tipo_val(a)]
 
 def utm_to_latlon(x, y):
     lon, lat = TRANSFORM.transform(x, y)
@@ -147,7 +154,7 @@ def utm_to_latlon(x, y):
 def get_address_components_from_coords(geom):
     """
     Obtiene la dirección completa de las coordenadas y la parsea en componentes.
-    Devuelve un diccionario con 'street', 'municipality', 'full_address'.
+    Devuelve un diccionario con 'street', 'municipality'.
     """
     street = ""
     municipality = ""
@@ -218,11 +225,6 @@ def format_intervention(a, geom):
     else:
         location_str = "ubicació desconeguda"
 
-    # Recortar caracteres:
-    # "🔥 Incendi {tipo} a {ubicacion}"
-    # "🕒 {hora} | 🚒 {num_dotaciones} dotaciones"
-    # Hemos simplificado "trabajando" por "dotaciones"
-    
     # Texto principal de la intervención
     intervention_text = (f"🔥 {classify(a)} a {location_str}\n"
                          f"🕒 {hora} | 🚒 {a['ACT_NUM_VEH']} dot.")
@@ -238,9 +240,19 @@ def send(text, api):
 # ---------------- MAIN --------------------------------------------------
 def main():
     api = None
+    # Solo intenta autenticarse si NO estamos en modo de prueba y las claves están presentes
     if not IS_TEST_MODE and all(TW_KEYS.values()):
-        auth = tweepy.OAuth1UserHandler(TW_KEYS["ck"], TW_KEYS["cs"], TW_KEYS["at"], TW_KEYS["as"])
-        api = tweepy.API(auth)
+        try:
+            auth = tweepy.OAuth1UserHandler(TW_KEYS["ck"], TW_KEYS["cs"], TW_KEYS["at"], TW_KEYS["as"])
+            api = tweepy.API(auth)
+            # Verificar credenciales para detectar errores tempranamente
+            api.verify_credentials()
+            logging.info("Autenticación con Twitter exitosa.")
+        except tweepy.TweepyException as e:
+            logging.error(f"Error de autenticación con Twitter: {e}. Asegúrate de que las claves son correctas y la API está accesible.")
+            # Si la autenticación falla, salimos para evitar intentar publicar
+            return
+
 
     last_id = load_state()
     feats = fetch_features()
@@ -308,10 +320,9 @@ def main():
         tweet_parts.append(f"• {title_text}:\n{formatted_interv}")
         max_id = max(max_id, a["ESRI_OID"])
     
-    # Reducción de "dotaciones trabajando" a "dot."
-    # Eliminación de "Incendi" en los títulos de la lista (ya está en el cuerpo)
-    
     final_tweet_text = "\n\n".join(tweet_parts) + f"\n\nFuente: {MAPA_OFICIAL}"
+    
+    # Solo enviar el tweet si no estamos en modo de prueba
     send(final_tweet_text, api)
     
     save_state(max_id)
