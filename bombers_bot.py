@@ -9,7 +9,7 @@ Requisitos:
     requests    geopy    tweepy>=4.0.0    pyproj
 """
 
-import os, json, logging, requests # 'requests' es clave para Telegram
+import os, json, logging, requests
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -17,15 +17,15 @@ from geopy.geocoders import Nominatim
 from pyproj import Transformer
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+# No es necesario importar tweepy si solo usaremos Telegram o la simulación
+# import tweepy 
+
 
 # --- CONFIG ---
 LAYER_URL = ("https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
              "ACTUACIONS_URGENTS_online_PRO_AMB_FASE_VIEW/FeatureServer/0")
 MIN_DOTACIONS = int(os.getenv("MIN_DOTACIONS", "3"))     # mínimo dotacions
 
-# Por defecto, el bot estará en modo de prueba (simulación).
-# Para que intente publicar en X, la variable de entorno IS_TEST_MODE debe ser "false".
-# Sin embargo, dado el error 403, recomendamos mantenerlo en "true" para X y usar Telegram.
 IS_TEST_MODE  = os.getenv("IS_TEST_MODE", "true").lower() == "true" 
 
 API_KEY       = os.getenv("ARCGIS_API_KEY", "") # Para ArcGIS
@@ -35,7 +35,7 @@ STATE_FILE = Path("state.json")
 GEOCODER   = Nominatim(user_agent="bombers_bot")
 TRANSFORM  = Transformer.from_crs(25831, 4326, always_xy=True)
 
-# Credenciales de X (Twitter) - Se mantienen, pero la publicación directa está limitada por la API
+# Credenciales de X (Twitter) - Se mantienen para compatibilidad, pero no se usan para publicar
 TW_KEYS = {
     "ck": os.getenv("TW_CONSUMER_KEY"),
     "cs": os.getenv("TW_CONSUMER_SECRET"),
@@ -51,7 +51,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 
-# Configuración de reintentos para requests (para ArcGIS)
+# Configuración de reintentos para requests (para ArcGIS y Nominatim)
 retries = Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503, 504])
 session = requests.Session()
 session.mount('https://', HTTPAdapter(max_retries=retries))
@@ -64,14 +64,15 @@ def load_state() -> int:
 def save_state(last_id: int):
     STATE_FILE.write_text(json.dumps({"last_id": last_id}))
 
-# --- CONSULTA ARCGIS ---
+# --- CONSULTA ARCGIS (SIMPLIFICADA) ---
 def fetch_features(limit=100):
     params = {
         "f": "json",
         "where": "1=1",
+        # Volvemos a los outFields que sabemos que funcionan bien, sin MUN_NOM_MUNICIPI
         "outFields": (
             "ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
-            "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM_MUNICIPI" # Incluimos MUN_NOM_MUNICIPI
+            "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2" 
         ),
         "orderByFields": "ACT_DAT_ACTUACIO DESC",
         "resultRecordCount": limit,
@@ -83,57 +84,22 @@ def fetch_features(limit=100):
     
     try:
         r = session.get(f"{LAYER_URL}/query", params=params, timeout=30)
-        r.raise_for_status()
+        r.raise_for_status() # Lanza un error si la respuesta HTTP no es 2xx
     except requests.exceptions.Timeout:
         logging.error("Timeout al consultar ArcGIS. Servidor no respondió a tiempo.")
         return []
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error de conexión al consultar ArcGIS: {e}")
-        if "400" in str(e) and "Invalid query parameters" in str(e):
-             logging.warning("Error 400 al obtener MUN_NOM_MUNICIPI. Intentando sin él.")
-        else:
-             logging.warning("Error de ArcGIS, pero no el esperado con MUN_NOM_MUNICIPI. Reintentando consulta básica.")
-        
-        params["outFields"] = ("ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
-                               "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
-        try:
-            r = session.get(f"{LAYER_URL}/query", params=params, timeout=30)
-            r.raise_for_status()
-            data = r.json()
-            if "error" in data:
-                logging.error("Fallback ArcGIS error %s: %s", data["error"]["code"], data["error"]["message"])
-                return []
-            for feature in data.get("features", []):
-                feature["attributes"]["_municipio_from_arcgis_success"] = False
-            return data.get("features", [])
-        except requests.exceptions.RequestException as e_fallback:
-            logging.error(f"Error en fallback de ArcGIS: {e_fallback}")
-            return []
+        # Capturamos cualquier error de la petición a ArcGIS aquí y logueamos.
+        # Ya no hay lógica de fallback doble dentro de esta función, simplificando.
+        logging.error(f"Error al consultar ArcGIS: {e}")
+        return []
 
     data = r.json()
     if "error" in data:
-        logging.error("ArcGIS error %s: %s", data["error"]["code"], data["error"]["message"])
-        if data["error"]["code"] == 400 and "Invalid query parameters" in data["error"]["message"]:
-            logging.warning("Error 400 al obtener MUN_NOM_MUNICIPI. Intentando sin él.")
-            params["outFields"] = ("ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
-                                   "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
-            try:
-                r = session.get(f"{LAYER_URL}/query", params=params, timeout=30)
-                r.raise_for_status()
-                data = r.json()
-                if "error" in data:
-                    logging.error("Fallback ArcGIS error %s: %s", data["error"]["code"], data["error"]["message"])
-                    return []
-                for feature in data.get("features", []):
-                    feature["attributes"]["_municipio_from_arcgis_success"] = False
-                return data.get("features", [])
-            except requests.exceptions.RequestException as e_fallback:
-                logging.error(f"Error en fallback de ArcGIS: {e_fallback}")
-                return []
+        logging.error("ArcGIS devolvió un error en los datos: %s", data["error"]["message"])
         return []
     
-    for feature in data.get("features", []):
-        feature["attributes"]["_municipio_from_arcgis_success"] = True
+    # Ya no añadimos "_municipio_from_arcgis_success" porque el municipio siempre vendrá de Nominatim
     return data.get("features", [])
 
 
@@ -193,25 +159,11 @@ def get_address_components_from_coords(geom):
 
 
 def format_intervention(a, geom):
-    municipio_arcgis = a.get("MUN_NOM_MUNICIPI")
-    _municipio_from_arcgis_success = a.get("_municipio_from_arcgis_success", False)
-
-    calle_geocoded = ""
-    municipio_geocoded = ""
-    
+    # La ubicación (calle y municipio) siempre vendrá de la geocodificación
     address_components = get_address_components_from_coords(geom)
-    calle_geocoded = address_components["street"]
-    municipio_geocoded = address_components["municipality"]
-
-    municipio_final = "ubicació desconeguda"
+    calle_final = address_components["street"] if address_components["street"] else ""
+    municipio_final = address_components["municipality"] if address_components["municipality"] else "ubicació desconeguda"
     
-    if _municipio_from_arcgis_success and municipio_arcgis:
-        municipio_final = municipio_arcgis
-    elif municipio_geocoded:
-        municipio_final = municipio_geocoded
-    
-    calle_final = calle_geocoded if calle_geocoded else ""
-
     hora = datetime.fromtimestamp(a["ACT_DAT_ACTUACIO"]/1000, tz=timezone.utc)\
                .astimezone(ZoneInfo("Europe/Madrid")).strftime("%H:%M")
     
@@ -220,13 +172,13 @@ def format_intervention(a, geom):
         location_str = f"{calle_final}, {municipio_final}"
     elif municipio_final != "ubicació desconeguda":
         location_str = municipio_final
-    elif calle_final:
+    elif calle_final: # Si solo tenemos calle (y el municipio es desconocido)
         location_str = calle_final
     else:
         location_str = "ubicació desconeguda"
 
     # Formato para el texto de la intervención (usando HTML para Telegram)
-    intervention_text = (f"🔥 <b>{classify(a).capitalize()}</b> a {location_str}\n" # Negrita para el tipo
+    intervention_text = (f"🔥 <b>{classify(a).capitalize()}</b> a {location_str}\n"
                          f"🕒 {hora} | 🚒 {a['ACT_NUM_VEH']} dot.")
     
     return intervention_text
@@ -252,50 +204,33 @@ def send_telegram_message(text):
     except requests.exceptions.RequestException as e:
         logging.error(f"Error al enviar notificación a Telegram: {e}")
 
-def send(text, api=None):
+def send(text, api=None): # api es un argumento heredado, pero ya no se usa para publicar en X
     """
-    Gestiona el envío del mensaje. Intenta publicar en X si IS_TEST_MODE es False y la API está disponible,
-    y siempre envía a Telegram si está configurado.
+    Gestiona el envío del mensaje. Solo envía a Telegram.
+    La lógica de X (Twitter) se mantiene en modo de simulación o inactiva debido a las restricciones.
     """
     if IS_TEST_MODE:
-        logging.info("MODO DE PRUEBA (X): No se publicará en Twitter.")
+        logging.info("MODO DE PRUEBA (X): No se publicará en Twitter. Simulando en consola.")
         logging.info("TUIT SIMULADO:\n" + text + "\n")
-    # Lógica para X (Twitter) - Se mantiene, pero se espera el error 403 si el nivel de acceso no es de pago
-    elif api: # Asegurarse de que el objeto API de Tweepy esté disponible
-        try:
-            # Aquí es donde tweepy intentaría publicar en X
-            # api.update_status(text) # Comentado porque sabemos que dará 403
-            logging.info("Intento de publicación en X (Twitter): No se realizará debido a restricciones de API o modo de prueba.")
-            logging.info("Texto que se intentaría publicar en X:\n" + text + "\n")
-        except Exception as e: # tweepy.TweepyException es más específico, pero Exception captura todo
-            logging.error(f"Error al intentar publicar en X (Twitter): {e}")
-            logging.error("Verifica tu nivel de acceso en developer.x.com/en/portal/product.")
+    # Lógica para X (Twitter) - Solo para loguear si se intentara publicar
+    # Aunque IS_TEST_MODE esté en "false" y api exista, ya no llamamos api.update_status
+    # para evitar el error 403 y la dependencia de tweepy.
     else:
-        logging.warning("El bot está en modo real para X, pero la API de Tweepy no se ha configurado (posible error de autenticación).")
+         logging.info("El bot está configurado para modo real, pero la publicación en X (Twitter) está deshabilitada/restringida.")
+         logging.info("Texto que se intentaría publicar en X:\n" + text + "\n")
 
-    # --- Envío a Telegram ---
+
+    # --- Envío a Telegram (SIEMPRE se intenta si está configurado) ---
     send_telegram_message(text)
     # --- Fin Envío a Telegram ---
 
 # --- MAIN ---
 def main():
     # Cargar el estado de los incidentes procesados
-    load_state()
+    last_id = load_state()
 
-    # La autenticación con X (Twitter) se mantiene para depuración si es necesario,
-    # pero no se usará para publicar si IS_TEST_MODE es True o el nivel de acceso es Free.
-    # Necesitarías el paquete 'tweepy' si descomentas esto.
-    # import tweepy
-    # api_twitter = None
-    # if not IS_TEST_MODE and all(TW_KEYS.values()):
-    #     try:
-    #         auth = tweepy.OAuth1UserHandler(TW_KEYS["ck"], TW_KEYS["cs"], TW_KEYS["at"], TW_KEYS["as"])
-    #         api_twitter = tweepy.API(auth)
-    #         api_twitter.verify_credentials()
-    #         logging.info("Autenticación con X (Twitter) exitosa.")
-    #     except tweepy.TweepyException as e:
-    #         logging.error(f"Error de autenticación con X (Twitter): {e}. Asegúrate de las claves y el acceso API.")
-    #         api_twitter = None # Asegurarse de que api_twitter sea None si falla
+    # No es necesario autenticarse con tweepy si solo se publica en Telegram.
+    # El objeto 'api' para tweepy ya no se creará aquí, simplificando el main.
 
     feats = fetch_features()
     if not feats:
@@ -304,7 +239,7 @@ def main():
 
     # Filtra solo las nuevas intervenciones (por ESRI_OID)
     # y también las que tienen DATA_AVIS para poder ordenar
-    new_feats = [f for f in feats if f["attributes"].get("ESRI_OID") and f["attributes"]["ESRI_OID"] > load_state()]
+    new_feats = [f for f in feats if f["attributes"].get("ESRI_OID") and f["attributes"]["ESRI_OID"] > last_id]
 
     most_recent_feature = None
     if new_feats:
@@ -317,10 +252,10 @@ def main():
            and (str(f["attributes"].get("COM_FASE") or "")).lower() in ("", "actiu")
     ]
     
-    intervenciones_para_tweet = [] # Esto ahora se usará para construir el mensaje de Telegram
+    intervenciones_para_notificar = [] # Se usará para construir el mensaje de Telegram
 
     if most_recent_feature:
-        intervenciones_para_tweet.append({"title": "Act. més recent", "feature": most_recent_feature})
+        intervenciones_para_notificar.append({"title": "Act. més recent", "feature": most_recent_feature})
 
     if candidatos_activos:
         candidatos_activos.sort(
@@ -333,47 +268,44 @@ def main():
         potential_relevant = candidatos_activos[0]
 
         if most_recent_feature is None or potential_relevant["attributes"]["ESRI_OID"] != most_recent_feature["attributes"]["ESRI_OID"]:
-            intervenciones_para_tweet.append({"title": "Inc. més rellevant", "feature": potential_relevant})
+            intervenciones_para_notificar.append({"title": "Inc. més rellevant", "feature": potential_relevant})
     
-    if len(intervenciones_para_tweet) == 2:
-        if intervenciones_para_tweet[0]["title"] == "Inc. més rellevant":
-            intervenciones_para_tweet.reverse() 
+    if len(intervenciones_para_notificar) == 2:
+        if intervenciones_para_notificar[0]["title"] == "Inc. més rellevant":
+            intervenciones_para_notificar.reverse() 
 
-    if not intervenciones_para_tweet:
+    if not intervenciones_para_notificar:
         logging.info("No hay intervenciones nuevas para notificar.")
         return
 
     telegram_message_parts = []
-    max_id_processed = load_state() # Usar la última ID cargada como base
+    max_id_to_save = last_id # Variable para el ID máximo que se guardará
 
-    for item in intervenciones_para_tweet:
+    for item in intervenciones_para_notificar:
         title_text = item["title"]
         feature = item["feature"]
         a = feature["attributes"]
         geom = feature.get("geometry")
         
-        # Generamos el texto formateado con HTML para Telegram
         formatted_interv = format_intervention(a, geom)
         telegram_message_parts.append(f"• <b>{title_text}</b>:\n{formatted_interv}")
         
-        # Actualizamos el max_id para guardar el último incidente procesado
         current_object_id = a.get("ESRI_OID")
         if current_object_id:
-             max_id_processed = max(max_id_processed, current_object_id)
-             # Marcar como procesado para futuras ejecuciones
-             PROCESSED_INCIDENTS[str(current_object_id)] = datetime.now().timestamp()
+             max_id_to_save = max(max_id_to_save, current_object_id) # Actualizar el ID máximo
+             # Nota: PROCESSED_INCIDENTS se usaría si queremos historial, pero para el state.json
+             # solo necesitamos el último ID más alto.
 
 
     final_telegram_text = "\n\n".join(telegram_message_parts) + f"\n\nFuente: <a href='{MAPA_OFICIAL}'>Mapa Oficial Bombers</a>"
     
-    # Enviar el mensaje a Telegram
-    send(final_telegram_text, None) # api es None, ya que no vamos a publicar en X directamente
-
+    # Enviar el mensaje a Telegram. El segundo argumento es api, que será None.
+    send(final_telegram_text, None) 
+    
     # Guardar el ID de la última actuación procesada para no repetirla
-    save_state(max_id_processed)
-    # Guardar el estado completo de los incidentes procesados
-    save_processed_incidents()
+    save_state(max_id_to_save)
 
 
 if __name__ == "__main__":
     main()
+    
