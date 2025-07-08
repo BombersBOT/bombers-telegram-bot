@@ -53,12 +53,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # --- Configuración de Gemini ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-gemini_model = None # Inicializamos a None por defecto
+gemini_model = None 
 
 if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        # CAMBIO CLAVE: Usamos 'models/gemini-1.5-flash' que sabemos que está disponible y recomendado.
         gemini_model = genai.GenerativeModel(
             'models/gemini-1.5-flash', 
             generation_config={"temperature": 0.2}
@@ -69,6 +68,7 @@ if GEMINI_API_KEY:
         gemini_model = None 
 else:
     logging.warning("GEMINI_API_KEY no configurada. Las funciones de IA no estarán disponibles.")
+    gemini_model = None 
 
 # --- FIN Configuración de Gemini ---
 
@@ -205,6 +205,7 @@ def get_address_components_from_coords(geom):
 def format_intervention_with_gemini(feature):
     """
     Formatea la intervención usando los datos de ArcGIS y Gemini para interpretación y búsqueda.
+    Devuelve el mensaje de Telegram, la relevancia y las palabras clave.
     """
     a = feature["attributes"]
     geom = feature.get("geometry")
@@ -250,8 +251,9 @@ def format_intervention_with_gemini(feature):
     gemini_interpretation = "No disponible (IA no configurada o error)."
     gemini_relevance = 0
     gemini_search_summary = "No se encontraron actualizaciones en Google (IA no configurada o no relevante)."
+    search_keywords = [] 
 
-    if gemini_model: # Asegurarse de que gemini_model no es None
+    if gemini_model: 
         try:
             # --- 3. Llamada a Gemini para interpretación ---
             prompt_interpret = f"""Analiza el siguiente incidente de Bombers:
@@ -266,7 +268,7 @@ def format_intervention_with_gemini(feature):
             Proporciona un resumen conciso y descriptivo del incidente.
             Estima su relevancia en una escala del 1 (muy bajo) al 10 (muy alto) para la población.
             Sugiere 2-3 palabras clave o hashtags (ej. #Incendio[Municipio]) para buscar actualizaciones en Google.
-            Formato de salida (JSON):
+            Formato de salida (JSON, solo el objeto JSON, sin envolver en bloques de código ni texto adicional):
             {{
               "resumen": "Aquí el resumen del incidente.",
               "relevancia": "N",
@@ -276,12 +278,16 @@ def format_intervention_with_gemini(feature):
             
             response_interpret = gemini_model.generate_content(prompt_interpret)
             try:
-                parsed_interpret = json.loads(response_interpret.text) 
+                response_text_cleaned = response_interpret.text.strip()
+                if response_text_cleaned.startswith('```json') and response_text_cleaned.endswith('```'):
+                    response_text_cleaned = response_text_cleaned[len('```json'):-len('```')].strip()
+                
+                parsed_interpret = json.loads(response_text_cleaned) 
                 gemini_interpretation = parsed_interpret.get("resumen", "Error al interpretar.")
                 gemini_relevance = int(parsed_interpret.get("relevancia", 0))
                 search_keywords = parsed_interpret.get("palabras_clave_busqueda", [])
             except json.JSONDecodeError:
-                logging.warning(f"Respuesta de Gemini no es JSON válido para interpretación: {response_interpret.text}")
+                logging.warning(f"Respuesta de Gemini no es JSON válido (después de limpieza) para interpretación: '{response_interpret.text}'. Puede que Gemini no haya seguido el formato o el JSON sea inválido.")
                 gemini_interpretation = "Resumen no disponible (Gemini no devolvió JSON válido)."
                 gemini_relevance = 0
                 search_keywords = []
@@ -294,8 +300,6 @@ def format_intervention_with_gemini(feature):
                 logging.info(f"Realizando búsqueda con Gemini para: {query}")
                 
                 try:
-                    # Aquí se asume que la extensión 'Google Search' está habilitada en Google AI Studio para este modelo.
-                    # El parámetro 'tools=[]' es correcto para indicar que el modelo puede usar las herramientas configuradas.
                     search_response = gemini_model.generate_content(
                         f"Resume muy concisamente (no más de 3 frases) noticias y actualizaciones sobre: '{query}'.", 
                         tools=[] 
@@ -313,7 +317,7 @@ def format_intervention_with_gemini(feature):
                     logging.error(f"Error al realizar búsqueda con Gemini: {search_e}")
                     gemini_search_summary = "Búsqueda con IA fallida."
             
-        except Exception as e: # Este es el try-except que capturó el 404 del modelo
+        except Exception as e: 
             logging.error(f"Error general al interactuar con la API de Gemini: {e}")
             gemini_interpretation = f"Error al interpretar con IA: {e}"
             gemini_search_summary = "Búsqueda con IA fallida."
@@ -335,8 +339,7 @@ def format_intervention_with_gemini(feature):
     
     telegram_message += f"🌐 <a href='{MAPA_OFICIAL}'>Mapa Oficial Bombers</a>"
 
-    return telegram_message
-
+    return telegram_message, gemini_relevance # Devolver también la relevancia
 
 # --- Funciones de envío ---
 def send_telegram_message(text):
@@ -349,17 +352,17 @@ def send_telegram_message(text):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML", # Crucial para que las negritas y enlaces funcionen
-        "disable_web_page_preview": True # Evita previsualizar el enlace al mapa
+        "parse_mode": "HTML", 
+        "disable_web_page_preview": True 
     }
     try:
         response = requests.post(telegram_url, json=payload, timeout=10)
-        response.raise_for_status() # Lanza un error si la respuesta HTTP no es 2xx
+        response.raise_for_status() 
         logging.info("Notificación enviada a Telegram exitosamente.")
     except requests.exceptions.RequestException as e:
         logging.error(f"Error al enviar notificación a Telegram: {e}")
 
-def send(text, api=None): # api es un argumento heredado, pero ya no se usa para publicar en X
+def send(text, api=None): 
     """
     Gestiona el envío del mensaje. Solo envía a Telegram.
     La lógica de X (Twitter) se mantiene en modo de simulación o inactiva debido a las restricciones.
@@ -367,7 +370,7 @@ def send(text, api=None): # api es un argumento heredado, pero ya no se usa para
     if IS_TEST_MODE:
         logging.info("MODO DE PRUEBA (X): No se publicará en Twitter. Simulando en consola.")
         logging.info("TUIT SIMULADO:\n" + text + "\n")
-    else: # Si IS_TEST_MODE es false, el bot está "en real"
+    else: 
          logging.info("La publicación en X (Twitter) está deshabilitada/restringida para este bot.")
          logging.info("Texto que se intentaría publicar en X:\n" + text + "\n")
 
@@ -382,70 +385,49 @@ def main():
     last_id = load_state()
 
     # --- INICIO BLOQUE DE DIAGNÓSTICO Y ASIGNACIÓN DE MODELO GEMINI ---
-    global gemini_model # Para poder reasignar el modelo si es necesario
+    global gemini_model 
     if GEMINI_API_KEY:
         try:
-            logging.info("Intentando listar modelos de Gemini disponibles...")
-            found_target_model = False
-            available_models_list = []
-            
-            # Iterar y recolectar modelos disponibles
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    available_models_list.append(m.name)
-                    logging.info(f"Modelo disponible para generateContent: {m.name}")
-                    # Comprobar si el modelo objetivo (gemini-1.5-flash) está en la lista
-                    if m.name == 'models/gemini-1.5-flash':
-                        found_target_model = True
-                else:
-                    logging.info(f"Modelo no soportado para generateContent: {m.name}")
-            
-            # Si el modelo objetivo no está, intentar un fallback
-            if not found_target_model:
-                logging.warning(f"El modelo objetivo 'models/gemini-1.5-flash' NO está en la lista de modelos disponibles para generateContent.")
-                logging.warning(f"Modelos disponibles: {', '.join(available_models_list) if available_models_list else 'Ninguno'}")
-                
-                # Intentar encontrar un fallback adecuado de la lista, priorizando Flash o Pro de 1.5/2.5
-                fallback_model_name = None
-                
-                # Priorizar modelos "flash" (más rápidos y baratos)
-                for model_name in available_models_list:
-                    if "flash" in model_name and ("1.5" in model_name or "2.5" in model_name) and "preview" not in model_name and "exp" not in model_name:
-                        fallback_model_name = model_name
-                        break
-                
-                # Si no hay flash, buscar pro
-                if not fallback_model_name:
-                    for model_name in available_models_list:
-                        if "pro" in model_name and ("1.5" in model_name or "2.5" in model_name) and "preview" not in model_name and "exp" not in model_name:
-                            fallback_model_name = model_name
-                            break
+            # Si gemini_model ya se inicializó arriba sin error, no intentamos de nuevo.
+            # Solo listamos modelos si gemini_model ya es un objeto válido.
+            if gemini_model is None: # Si falló en la inicialización global, intentamos de nuevo aquí con más logs.
+                logging.error("gemini_model no se inicializó globalmente. Intentando re-inicializar y listar modelos.")
+                gemini_model = genai.GenerativeModel(
+                    'models/gemini-1.5-flash',
+                    generation_config={"temperature": 0.2}
+                )
+                logging.info("Modelo 'models/gemini-1.5-flash' re-inicializado con éxito en main().")
 
-                if fallback_model_name:
-                    logging.warning(f"Intentando usar modelo fallback: '{fallback_model_name}'")
-                    try:
-                        gemini_model = genai.GenerativeModel(
-                            fallback_model_name,
-                            generation_config={"temperature": 0.2}
-                        )
-                        logging.info(f"Modelo Gemini fallback '{fallback_model_name}' inicializado con éxito.")
-                    except Exception as e:
-                        logging.error(f"Error al inicializar modelo fallback '{fallback_model_name}': {e}")
-                        gemini_model = None # Fallback fallido
-                else:
-                    logging.error("No se encontró ningún modelo de Gemini compatible para generateContent en la lista.")
-                    gemini_model = None
+            # Ahora que gemini_model_ ha sido (re)inicializado, listamos modelos si es válido.
+            if gemini_model:
+                logging.info("Intentando listar modelos de Gemini disponibles para confirmación...")
+                found_target_model = False
+                available_models_for_gc = [] 
+                
+                for m in genai.list_models():
+                    if 'generateContent' in m.supported_generation_methods:
+                        available_models_for_gc.append(m.name)
+                        logging.info(f"Modelo disponible para generateContent: {m.name}")
+                        if m.name == 'models/gemini-1.5-flash': 
+                            found_target_model = True
+                    else:
+                        logging.info(f"Modelo no soportado para generateContent: {m.name}")
+                
+                if not found_target_model:
+                    logging.warning(f"El modelo objetivo 'models/gemini-1.5-flash' NO está en la lista de modelos disponibles para generateContent.")
+                    logging.warning(f"Modelos compatibles: {', '.join(available_models_for_gc) if available_models_for_gc else 'Ninguno'}")
+                    logging.warning("Se continuará sin este modelo si no se pudo inicializar.")
+                    # Si no encontramos el modelo objetivo, nos aseguramos de que gemini_model sea None
+                    # para que format_intervention_with_gemini lo sepa.
+                    gemini_model = None 
+                
+                logging.info("Listado de modelos de Gemini completado.")
             else:
-                # Si el modelo objetivo (gemini-1.5-flash) está disponible, asegúrarse de que gemini_model
-                # esté apuntando a ese modelo (ya se hizo en la inicialización global si no falló).
-                # Podríamos re-inicializarlo aquí para estar 100% seguros, pero no es estrictamente necesario
-                # si la inicialización global fue exitosa.
-                pass 
-            
-            logging.info("Listado de modelos de Gemini completado.")
-        except Exception as e:
-            logging.error(f"Error al listar modelos de Gemini: {e}. Revisa tu GEMINI_API_KEY y la habilitación de la API de Generative Language en Google Cloud.")
-            gemini_model = None # Si listar modelos falla, el modelo no estará disponible.
+                logging.warning("gemini_model sigue siendo None después de la inicialización y/o re-inicialización. No se listarán modelos.")
+
+        except Exception as e: # Captura errores durante el listado o re-inicialización en main()
+            logging.error(f"Error crítico en el bloque de diagnóstico/inicialización de Gemini en main(): {e}.")
+            gemini_model = None # Asegurarse de que el modelo es None si falla el diagnóstico
     else:
         logging.warning("GEMINI_API_KEY no configurada. Saltando verificación de modelos Gemini y operaciones de IA.")
         gemini_model = None 
@@ -465,19 +447,77 @@ def main():
 
     max_id_to_save = last_id 
     
-    new_feats.sort(key=lambda f: f["attributes"].get("ACT_DAT_ACTUACIO", 0), reverse=True) 
+    # --- INICIO: Lógica de priorización y envío ---
+    processed_incidents = []
 
+    # Procesar todas las nuevas actuaciones con Gemini para obtener su relevancia
     for feature in new_feats:
         current_object_id = feature["attributes"].get("ESRI_OID")
         
-        telegram_message = format_intervention_with_gemini(feature)
+        # format_intervention_with_gemini ahora devuelve el mensaje Y la relevancia
+        telegram_message, relevance = format_intervention_with_gemini(feature)
         
-        send(telegram_message, None) 
+        processed_incidents.append({
+            "feature": feature,
+            "message": telegram_message,
+            "relevance": relevance,
+            "object_id": current_object_id,
+            "timestamp": feature["attributes"].get("ACT_DAT_ACTUACIO", 0) 
+        })
         
+        # Actualizar el max_id_to_save independientemente de si se va a enviar o no
         if current_object_id:
              max_id_to_save = max(max_id_to_save, current_object_id)
         
-        time.sleep(1) 
+        time.sleep(0.5) 
+
+    # --- Lógica de selección de mensajes a enviar ---
+    messages_to_send_final = []
+    sent_object_ids = set() # Para evitar duplicados
+
+    # 1. Identificar y añadir la actuación NUEVA más reciente
+    most_recent_incident_processed = None
+    if processed_incidents:
+        # Asegurarse de que processed_incidents está ordenado por timestamp descendente
+        processed_incidents.sort(key=lambda x: x["timestamp"], reverse=True)
+        most_recent_incident_processed = processed_incidents[0]
+    
+    if most_recent_incident_processed:
+        messages_to_send_final.append(most_recent_incident_processed["message"])
+        sent_object_ids.add(most_recent_incident_processed["object_id"])
+        logging.info(f"Añadida la actuación nueva más reciente (ID: {most_recent_incident_processed['object_id']}) a la cola de envío.")
+
+    # 2. Filtrar y añadir actuaciones importantes (relevancia >= 7), excluyendo la ya enviada
+    important_incidents_filtered = [
+        inc for inc in processed_incidents 
+        if inc["relevance"] >= 7 and inc["object_id"] not in sent_object_ids
+    ]
+
+    # Ordenar las importantes por relevancia (descendente) y luego por fecha (descendente)
+    important_incidents_filtered.sort(key=lambda x: (x["relevance"], x["timestamp"]), reverse=True)
+
+    # Limitar el número total de mensajes a enviar (ej. 3 mensajes en total: 1 reciente + 2 importantes)
+    MAX_TOTAL_MESSAGES_PER_RUN = 3
+    current_messages_sent_count = len(messages_to_send_final)
+
+    for incident in important_incidents_filtered:
+        if current_messages_sent_count < MAX_TOTAL_MESSAGES_PER_RUN:
+            messages_to_send_final.append(incident["message"])
+            sent_object_ids.add(incident["object_id"])
+            logging.info(f"Añadida actuación importante (ID: {incident['object_id']}, Relevancia: {incident['relevance']}) a la cola de envío.")
+            current_messages_sent_count += 1
+        else:
+            break # Si ya alcanzamos el límite, no añadir más
+
+    if not messages_to_send_final:
+        logging.info("No hay actuaciones nuevas que superen los criterios para ser enviadas.")
+        
+    # --- Envío de los mensajes finales ---
+    for message_content in messages_to_send_final:
+        send(message_content, None)
+        time.sleep(1) # Pausa entre envíos de mensajes a Telegram
+
+    # --- FIN: Lógica de priorización y envío ---
     
     save_state(max_id_to_save)
 
