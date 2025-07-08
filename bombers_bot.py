@@ -19,8 +19,7 @@ from geopy.geocoders import Nominatim
 from pyproj import Transformer
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import time # <--- AÑADIDO: Importar el módulo time
-
+import time 
 
 # Importar la librería de Gemini
 import google.generativeai as genai 
@@ -57,12 +56,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    # Inicializamos gemini_model aquí, pero la disponibilidad real se verificará en main()
-    gemini_model = genai.GenerativeModel(
-        'gemini-pro', 
-        generation_config={"temperature": 0.2}
-    )
-    logging.info("API de Gemini configurada (intentando usar gemini-pro).")
+    gemini_model = None # Se inicializará con el modelo correcto después de listar
+    logging.info("API de Gemini configurada. Verificando modelos disponibles...")
 else:
     logging.warning("GEMINI_API_KEY no configurada. Las funciones de IA no estarán disponibles.")
     gemini_model = None 
@@ -248,7 +243,7 @@ def format_intervention_with_gemini(feature):
     gemini_relevance = 0
     gemini_search_summary = "No se encontraron actualizaciones en Google (IA no configurada o no relevante)."
 
-    if gemini_model:
+    if gemini_model: # Asegurarse de que gemini_model no es None
         try:
             # --- 3. Llamada a Gemini para interpretación ---
             prompt_interpret = f"""Analiza el siguiente incidente de Bombers:
@@ -310,10 +305,13 @@ def format_intervention_with_gemini(feature):
                     logging.error(f"Error al realizar búsqueda con Gemini: {search_e}")
                     gemini_search_summary = "Búsqueda con IA fallida."
             
-        except Exception as e:
+        except Exception as e: # Este es el try-except que capturó el 404 del modelo
             logging.error(f"Error general al interactuar con la API de Gemini: {e}")
             gemini_interpretation = f"Error al interpretar con IA: {e}"
             gemini_search_summary = "Búsqueda con IA fallida."
+    else: # Si gemini_model es None (API_KEY no configurada)
+        logging.warning("gemini_model no está disponible. Saltando interacciones con la IA.")
+
 
     # --- 5. Construir el mensaje final para Telegram (HTML) ---
     telegram_message = (
@@ -374,6 +372,31 @@ def send(text, api=None): # api es un argumento heredado, pero ya no se usa para
 def main():
     last_id = load_state()
 
+    # --- INICIO BLOQUE DE DIAGNÓSTICO DE GEMINI ---
+    if GEMINI_API_KEY:
+        try:
+            logging.info("Intentando listar modelos de Gemini disponibles...")
+            for m in genai.list_models():
+                # Filtrar solo modelos que soporten generateContent
+                if 'generateContent' in m.supported_generation_methods:
+                    logging.info(f"Modelo disponible: {m.name}")
+                    if m.name == 'models/gemini-pro':
+                        # Si 'gemini-pro' está disponible, lo asignamos.
+                        # Aquí podemos asignar el modelo definitivo si está en la lista.
+                        # genai.GenerativeModel ya se hizo arriba, así que solo confirmamos la disponibilidad.
+                        logging.info("El modelo 'gemini-pro' está disponible para generateContent.")
+                else:
+                    logging.info(f"Modelo no soportado para generateContent: {m.name}")
+            logging.info("Listado de modelos de Gemini completado.")
+        except Exception as e:
+            logging.error(f"Error al listar modelos de Gemini: {e}. Revisa tu GEMINI_API_KEY y la habilitación de la API de Generative Language en Google Cloud.")
+            # Si listar modelos falla, es poco probable que el resto funcione, así que salimos.
+            return
+    else:
+        logging.warning("GEMINI_API_KEY no configurada. Saltando verificación de modelos Gemini.")
+    # --- FIN BLOQUE DE DIAGNÓSTICO DE GEMINI ---
+
+
     feats = fetch_features()
     if not feats:
         logging.info("ArcGIS devolvió 0 features.")
@@ -387,7 +410,7 @@ def main():
 
     max_id_to_save = last_id 
     
-    new_feats.sort(key=lambda f: f["attributes"].get("ACT_DAT_ACTUACIO", 0), reverse=True) # Ordenar de más reciente a más antiguo
+    new_feats.sort(key=lambda f: f["attributes"].get("ACT_DAT_ACTUACIO", 0), reverse=True) 
 
     for feature in new_feats:
         current_object_id = feature["attributes"].get("ESRI_OID")
@@ -399,7 +422,7 @@ def main():
         if current_object_id:
              max_id_to_save = max(max_id_to_save, current_object_id)
         
-        time.sleep(1) # Pausa para evitar saturar APIs
+        time.sleep(1) 
     
     save_state(max_id_to_save)
 
