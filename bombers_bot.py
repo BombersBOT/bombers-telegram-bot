@@ -59,8 +59,8 @@ if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         gemini_model = genai.GenerativeModel(
-            'models/gemini-1.5-flash', 
-            generation_config={"temperature": 0.2}
+            'models/gemini-1.5-flash', # Asegurarse de que este es el modelo correcto
+            generation_config={"temperature": 0.2} # Temperatura baja para factualidad
         )
         logging.info("API de Gemini configurada y modelo 'models/gemini-1.5-flash' inicializado.")
     except Exception as e:
@@ -97,7 +97,7 @@ def fetch_features(limit=100):
         "outFields": (
             "ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
             "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM_MUNICIPI,"
-            "COM_NOM_COMARCA,PRO_NOM_PROVINCIA" 
+            "COM_NOM_COMARCA,PRO_NOM_PROVINCIA" # <-- CAMPOS DE UBICACIÓN AÑADIDOS
         ),
         "orderByFields": "ACT_DAT_ACTUACIO DESC",
         "resultRecordCount": limit,
@@ -219,8 +219,8 @@ def format_intervention_with_gemini(feature):
 
     # --- 1. Obtener Ubicación Completa (priorizando ArcGIS) ---
     municipio_arcgis = a.get("MUN_NOM_MUNICIPI")
-    comarca_arcgis = a.get("COM_NOM_COMARCA")
-    provincia_arcgis = a.get("PRO_NOM_PROVINCIA")
+    comarca_arcgis = a.get("COM_NOM_COMARCA") # Nuevo campo
+    provincia_arcgis = a.get("PRO_NOM_PROVINCIA") # Nuevo campo
     _full_location_from_arcgis_success = a.get("_full_location_from_arcgis_success", False)
 
     calle_geocoded = ""
@@ -230,19 +230,19 @@ def format_intervention_with_gemini(feature):
     calle_final = address_components["street"] if address_components["street"] else ""
     municipio_geocoded = address_components["municipality"] if address_components["municipality"] else ""
 
-    # Construir location_str lo más completo posible
+    # Construir location_str lo más completo posible para Gemini
     location_parts = []
-    if calle_final: # Prioriza calle de geocodificación
+    if calle_final: 
         location_parts.append(calle_final)
     
-    if _full_location_from_arcgis_success: # Si ArcGIS dio ubicación completa
+    if _full_location_from_arcgis_success: 
         if municipio_arcgis and municipio_arcgis not in location_parts:
             location_parts.append(municipio_arcgis)
-        if comarca_arcgis and comarca_arcgis not in location_parts:
+        if comarca_arcgis and comarca_arcgis not in location_parts: # Nuevo
             location_parts.append(comarca_arcgis)
-        if provincia_arcgis and provincia_arcgis not in location_parts:
+        if provincia_arcgis and provincia_arcgis not in location_parts: # Nuevo
             location_parts.append(provincia_arcgis)
-    elif municipio_geocoded and municipio_geocoded not in location_parts: # Si no ArcGIS, usar geocodificado
+    elif municipio_geocoded and municipio_geocoded not in location_parts:
         location_parts.append(municipio_geocoded)
     
     location_str = ", ".join(location_parts) if location_parts else "ubicació desconeguda"
@@ -261,10 +261,10 @@ def format_intervention_with_gemini(feature):
         "tipo_alarma2": a.get("TAL_DESC_ALARMA2"),
         "dotaciones": a.get("ACT_NUM_VEH"),
         "fase": a.get("COM_FASE"),
-        "ubicacion_completa": location_str, # Ubicación más precisa
+        "ubicacion_completa": location_str, 
         "municipio": municipio_arcgis if _full_location_from_arcgis_success else municipio_geocoded,
-        "comarca": comarca_arcgis if _full_location_from_arcgis_success else "",
-        "provincia": provincia_arcgis if _full_location_from_arcgis_success else "",
+        "comarca": comarca_arcgis if _full_location_from_arcgis_success else "", # Nuevo
+        "provincia": provincia_arcgis if _full_location_from_arcgis_success else "", # Nuevo
         "hora": hora_str,
         "fecha": fecha_str,
         "tipo_clasificado": classify(a) 
@@ -278,28 +278,30 @@ def format_intervention_with_gemini(feature):
     if gemini_model: 
         try:
             # --- 3. Llamada a Gemini para interpretación ---
-            # Prompt mejorado para la ubicación y para la síntesis del tipo
-            prompt_interpret = f"""Analiza el siguiente incidente de Bombers.
+            # Prompt mejorado: mayor detalle, síntesis del tipo, precisión geográfica, JSON puro.
+            prompt_interpret = f"""Analiza el siguiente incidente de Bombers y proporciona un resumen descriptivo e informativo.
             Datos del incidente:
-            - Tipo alarma principal: {incident_data_for_gemini['tipo_alarma1']}
-            - Tipo alarma secundaria: {incident_data_for_gemini['tipo_alarma2']}
-            - Dotaciones: {incident_data_for_gemini['dotaciones']}
-            - Fase: {incident_data_for_gemini['fase']}
-            - Ubicación: {incident_data_for_gemini['ubicacion_completa']}
+            - Tipo alarma principal de Bombers: {incident_data_for_gemini['tipo_alarma1']}
+            - Tipo alarma secundaria de Bombers: {incident_data_for_gemini['tipo_alarma2']}
+            - Clasificación general del bot: {incident_data_for_gemini['tipo_clasificado']}
+            - Dotaciones movilizadas: {incident_data_for_gemini['dotaciones']}
+            - Fase actual del incidente: {incident_data_for_gemini['fase']}
+            - Ubicación exacta: {incident_data_for_gemini['ubicacion_completa']}
             - Municipio: {incident_data_for_gemini['municipio']}
             - Comarca: {incident_data_for_gemini['comarca']}
             - Provincia: {incident_data_for_gemini['provincia']}
-            - Fecha y Hora: {incident_data_for_gemini['fecha']} a las {incident_data_for_gemini['hora']}
-            - Clasificación básica: {incident_data_for_gemini['tipo_clasificado']}
+            - Fecha y Hora del aviso: {incident_data_for_gemini['fecha']} a las {incident_data_for_gemini['hora']}
 
-            Proporciona un resumen descriptivo del incidente (entre 3 y 5 frases), fusionando los tipos de alarma y la clasificación básica de forma natural.
-            Estima su relevancia en una escala del 1 (muy bajo, poco impacto) al 10 (muy alto, gran impacto o peligro) para la población.
-            Sugiere 2-3 palabras clave o hashtags (ej. #Incendio[Municipio], #Incendio[Tipo]) para buscar actualizaciones en Google. Asegúrate de que las palabras clave geográficas sean exactas al municipio y provincia proporcionados.
+            Proporciona un resumen conciso y muy descriptivo del incidente (entre 3 y 5 frases).
+            Asegúrate de fusionar el tipo de alarma principal, secundaria y la clasificación general de forma natural y sin redundancias.
+            Confirma la ubicación geográfica exacta (municipio, comarca, provincia) si se ha proporcionado, evitando errores.
+            Estima su relevancia en una escala del 1 (muy bajo, poco impacto) al 10 (muy alto, gran impacto o peligro) para la población afectada.
+            Sugiere 2-3 palabras clave o hashtags (ej. #Incendio[Municipio], #Incendio[Tipo]) para buscar actualizaciones en Google. Asegúrate de que las palabras clave geográficas sean exactas y no infieras provincias si no se han dado.
             Formato de salida (JSON, solo el objeto JSON, sin envolver en bloques de código ni texto adicional):
             {{
-              "resumen": "Aquí el resumen del incidente.",
+              "resumen": "Aquí el resumen detallado del incidente, integrando los tipos de alarma y confirmando la ubicación geográfica de forma precisa.",
               "relevancia": "N",
-              "palabras_clave_busqueda": ["palabra1", "palabra2"]
+              "palabras_clave_busqueda": ["palabra1", "palabra2", "palabra3"]
             }}
             """
             
@@ -314,7 +316,7 @@ def format_intervention_with_gemini(feature):
                 gemini_relevance = int(parsed_interpret.get("relevancia", 0))
                 search_keywords = parsed_interpret.get("palabras_clave_busqueda", [])
             except json.JSONDecodeError:
-                logging.warning(f"Respuesta de Gemini no es JSON válido (después de limpieza) para interpretación: '{response_interpret.text}'.")
+                logging.warning(f"Respuesta de Gemini no es JSON válido (después de limpieza) para interpretación: '{response_interpret.text}'. Puede que Gemini no haya seguido el formato o el JSON sea inválido.")
                 gemini_interpretation = "Resumen no disponible (Gemini no devolvió JSON válido)."
                 gemini_relevance = 0
                 search_keywords = []
@@ -323,13 +325,12 @@ def format_intervention_with_gemini(feature):
 
             # --- 4. Llamada a Gemini para búsqueda (si es relevante) ---
             if gemini_relevance >= 7 and search_keywords: 
-                # Consulta de búsqueda más precisa
-                query = f"incendio {incident_data_for_gemini['ubicacion_completa']} {' '.join(search_keywords)} últimas noticias"
+                query = f"incendio {incident_data_for_gemini['ubicacion_completa']} {incident_data_for_gemini['municipio']} {incident_data_for_gemini['provincia']} {' '.join(search_keywords)} noticias, última hora"
                 logging.info(f"Realizando búsqueda con Gemini para: {query}")
                 
                 try:
                     search_response = gemini_model.generate_content(
-                        f"Resume las noticias y actualizaciones más relevantes (aproximadamente 50-100 palabras) sobre: '{query}'. Enfócate en el estado actual y el impacto. Si no hay resultados relevantes, indícalo.", 
+                        f"Resume las noticias y actualizaciones más relevantes (aproximadamente 50-100 palabras, evitando 'no hay resultados') sobre: '{query}'. Enfócate en el estado actual, el impacto y si hay personas afectadas. Si la búsqueda no arroja resultados significativos, indica 'No se encontraron actualizaciones relevantes en Google'.", 
                         tools=[] 
                     )
                     
@@ -338,7 +339,8 @@ def format_intervention_with_gemini(feature):
                          # Intentar detectar si no hay resultados reales por parte de Gemini
                          if "no se encontraron resultados" in gemini_search_summary.lower() or \
                             "no puedo encontrar" in gemini_search_summary.lower() or \
-                            "no se encontraron noticias relevantes" in gemini_search_summary.lower():
+                            "no se encontraron noticias relevantes" in gemini_search_summary.lower() or \
+                            "no hay información disponible" in gemini_search_summary.lower(): # Ampliado
                             gemini_search_summary = "No se encontraron actualizaciones relevantes en Google."
                          else:
                              logging.info(f"Gemini búsqueda: {gemini_search_summary}")
@@ -357,7 +359,6 @@ def format_intervention_with_gemini(feature):
 
 
     # --- 5. Construir el mensaje final para Telegram (HTML) ---
-    # La descripción del tipo ahora la hace Gemini en el 'resumen'
     telegram_message = (
         f"🚨 <b>AVÍS BOMBERS</b> | {incident_data_for_gemini['ubicacion_completa']} 🚨\n\n"
         f"<b>Fecha:</b> {fecha_str} | <b>Hora:</b> {hora_str} | <b>Dotaciones:</b> {a.get('ACT_NUM_VEH')} | <b>Fase:</b> {a.get('COM_FASE', 'Desconeguda')}\n"
@@ -365,12 +366,13 @@ def format_intervention_with_gemini(feature):
         f"<i>Resumen IA:</i> {gemini_interpretation}\n\n" # El resumen ya debería incluir el tipo natural
     )
     
+    # Solo añadir actualizaciones si son relevantes y no son el mensaje por defecto de "no hay"
     if gemini_relevance >= 7 and gemini_search_summary and "no se encontraron actualizaciones relevantes" not in gemini_search_summary:
          telegram_message += f"<i>Actualizaciones IA (Google):</i> {gemini_search_summary}\n\n"
     
     telegram_message += f"🌐 <a href='{MAPA_OFICIAL}'>Mapa Oficial Bombers</a>"
 
-    return telegram_message, gemini_relevance, timestamp_ms # Devolver también la relevancia y timestamp para ordenar
+    return telegram_message, gemini_relevance, timestamp_ms 
 
 # --- Funciones de envío ---
 def send_telegram_message(text):
@@ -412,12 +414,12 @@ def send(text, api=None):
 
 # --- MAIN ---
 def main():
+    # Cargar el estado de los incidentes procesados
     last_id = load_state()
 
     global gemini_model 
     if GEMINI_API_KEY:
         try:
-            logging.info("Intentando listar modelos de Gemini disponibles para confirmación...")
             if gemini_model is None: 
                 logging.error("gemini_model no se inicializó globalmente. Intentando re-inicializar y listar modelos.")
                 gemini_model = genai.GenerativeModel(
@@ -507,11 +509,12 @@ def main():
         if inc["relevance"] >= MIN_RELEVANCE_FOR_IMPORTANT and inc["object_id"] not in sent_object_ids
     ]
 
-    # Ordenar las importantes: primero por relevancia (desc), luego por fecha (desc)
-    important_incidents_filtered.sort(key=lambda x: (x["relevance"], x["timestamp"]), reverse=True)
+    # Ordenar las importantes por relevancia (descendente) y luego por fecha (descendente)
+    important_incidents_filtered.sort(key=lambda x: (x["relevancia"], x["timestamp"]), reverse=True) # <-- Corregido: relevance, no 'relevance'
 
-    # Añadir al resto de la lista hasta el límite
+    # Limitar el número de mensajes a enviar (ej. 3 mensajes en total)
     current_messages_count = len(messages_to_send_final)
+
     for incident in important_incidents_filtered:
         if current_messages_count < MAX_TOTAL_MESSAGES_PER_RUN:
             messages_to_send_final.append(incident["message"])
