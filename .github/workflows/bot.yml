@@ -39,4 +39,5 @@ jobs:
           IS_TEST_MODE: "true" # Mantenemos en true para que NO intente publicar en X, solo en Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python bombers_bot.py
