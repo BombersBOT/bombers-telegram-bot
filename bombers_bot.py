@@ -93,9 +93,11 @@ def fetch_features(limit=100):
     params = {
         "f": "json",
         "where": "1=1",
+        # Incluimos COM_NOM_COMARCA y PRO_NOM_PROVINCIA para mejorar la precisión geográfica
         "outFields": (
             "ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
-            "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM_MUNICIPI" 
+            "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM_MUNICIPI,"
+            "COM_NOM_COMARCA,PRO_NOM_PROVINCIA" 
         ),
         "orderByFields": "ACT_DAT_ACTUACIO DESC",
         "resultRecordCount": limit,
@@ -113,16 +115,19 @@ def fetch_features(limit=100):
         return []
     except requests.exceptions.RequestException as e:
         logging.error(f"Error de conexión al consultar ArcGIS: {e}")
+        # Lógica de fallback si la consulta inicial falla (ej. por campos)
         if "400" in str(e) and "Invalid query parameters" in str(e):
-            logging.warning("Error 400 al obtener MUN_NOM_MUNICIPI. Intentando sin él.")
-            params["outFields"] = ("ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
+            logging.warning("Error 400 al obtener campos de ubicación de ArcGIS. Intentando sin ellos.")
+            # Si la consulta con campos de ubicación falla, hacemos un fallback sin ellos.
+            params["outFields"] = ("ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
                                    "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
             try:
                 r = session.get(f"{LAYER_URL}/query", params=params, timeout=30)
                 r.raise_for_status()
                 data = r.json()
                 for feature in data.get("features", []):
-                    feature["attributes"]["_municipio_from_arcgis_success"] = False
+                    # Marcamos que la ubicación no vino completa de ArcGIS
+                    feature["attributes"]["_full_location_from_arcgis_success"] = False 
                 return data.get("features", [])
             except requests.exceptions.RequestException as e_fallback:
                 logging.error(f"Error en fallback de ArcGIS: {e_fallback}")
@@ -132,24 +137,26 @@ def fetch_features(limit=100):
     data = r.json()
     if "error" in data:
         logging.error("ArcGIS devolvió un error en los datos: %s", data["error"]["message"])
+        # Otro fallback si el error viene en el JSON de datos
         if data["error"]["code"] == 400 and "Invalid query parameters" in data["error"]["message"]:
-            logging.warning("Error 400 al obtener MUN_NOM_MUNICIPI. Intentando sin él. (Post-JSON parse)")
-            params["outFields"] = ("ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
+             logging.warning("Error 400 al obtener campos de ubicación de ArcGIS. Intentando sin ellos. (Post-JSON parse)")
+             params["outFields"] = ("ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
                                    "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
-            try:
+             try:
                 r = session.get(f"{LAYER_URL}/query", params=params, timeout=30)
                 r.raise_for_status()
                 data = r.json()
                 for feature in data.get("features", []):
-                    feature["attributes"]["_municipio_from_arcgis_success"] = False
+                    feature["attributes"]["_full_location_from_arcgis_success"] = False
                 return data.get("features", [])
-            except requests.exceptions.RequestException as e_fallback:
+             except requests.exceptions.RequestException as e_fallback:
                 logging.error(f"Error en fallback de ArcGIS: {e_fallback}")
                 return []
         return []
     
+    # Marcamos que la ubicación completa SÍ vino de ArcGIS
     for feature in data.get("features", []):
-        feature["attributes"]["_municipio_from_arcgis_success"] = True
+        feature["attributes"]["_full_location_from_arcgis_success"] = True
     return data.get("features", [])
 
 # --- UTILIDADES ---
@@ -210,41 +217,56 @@ def format_intervention_with_gemini(feature):
     a = feature["attributes"]
     geom = feature.get("geometry")
 
-    # --- 1. Obtener Ubicación (Calle y Municipio) ---
+    # --- 1. Obtener Ubicación Completa (priorizando ArcGIS) ---
     municipio_arcgis = a.get("MUN_NOM_MUNICIPI")
-    _municipio_from_arcgis_success = a.get("_municipio_from_arcgis_success", False)
+    comarca_arcgis = a.get("COM_NOM_COMARCA")
+    provincia_arcgis = a.get("PRO_NOM_PROVINCIA")
+    _full_location_from_arcgis_success = a.get("_full_location_from_arcgis_success", False)
 
+    calle_geocoded = ""
+    municipio_geocoded = ""
+    
     address_components = get_address_components_from_coords(geom)
     calle_final = address_components["street"] if address_components["street"] else ""
     municipio_geocoded = address_components["municipality"] if address_components["municipality"] else ""
 
-    municipio_final = "ubicació desconeguda"
-    if _municipio_from_arcgis_success and municipio_arcgis:
-        municipio_final = municipio_arcgis
-    elif municipio_geocoded:
-        municipio_final = municipio_geocoded
+    # Construir location_str lo más completo posible
+    location_parts = []
+    if calle_final: # Prioriza calle de geocodificación
+        location_parts.append(calle_final)
     
-    location_str = ""
-    if calle_final and municipio_final != "ubicació desconeguda":
-        location_str = f"{calle_final}, {municipio_final}"
-    elif municipio_final != "ubicació desconeguda":
-        location_str = municipio_final
-    elif calle_final:
-        location_str = calle_final
-    else:
-        location_str = "ubicació desconeguda"
+    if _full_location_from_arcgis_success: # Si ArcGIS dio ubicación completa
+        if municipio_arcgis and municipio_arcgis not in location_parts:
+            location_parts.append(municipio_arcgis)
+        if comarca_arcgis and comarca_arcgis not in location_parts:
+            location_parts.append(comarca_arcgis)
+        if provincia_arcgis and provincia_arcgis not in location_parts:
+            location_parts.append(provincia_arcgis)
+    elif municipio_geocoded and municipio_geocoded not in location_parts: # Si no ArcGIS, usar geocodificado
+        location_parts.append(municipio_geocoded)
+    
+    location_str = ", ".join(location_parts) if location_parts else "ubicació desconeguda"
 
-    hora = datetime.fromtimestamp(a["ACT_DAT_ACTUACIO"]/1000, tz=timezone.utc)\
-               .astimezone(ZoneInfo("Europe/Madrid")).strftime("%H:%M")
+    # Hora y Fecha del aviso
+    timestamp_ms = a.get("ACT_DAT_ACTUACIO", 0)
+    hora_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)\
+                      .astimezone(ZoneInfo("Europe/Madrid"))
     
+    hora_str = hora_dt.strftime("%H:%M")
+    fecha_str = hora_dt.strftime("%d/%m/%Y") # Incluir el día del aviso
+
     # --- 2. Preparar datos para Gemini ---
     incident_data_for_gemini = {
         "tipo_alarma1": a.get("TAL_DESC_ALARMA1"),
         "tipo_alarma2": a.get("TAL_DESC_ALARMA2"),
         "dotaciones": a.get("ACT_NUM_VEH"),
         "fase": a.get("COM_FASE"),
-        "ubicacion_geo": location_str,
-        "hora": hora,
+        "ubicacion_completa": location_str, # Ubicación más precisa
+        "municipio": municipio_arcgis if _full_location_from_arcgis_success else municipio_geocoded,
+        "comarca": comarca_arcgis if _full_location_from_arcgis_success else "",
+        "provincia": provincia_arcgis if _full_location_from_arcgis_success else "",
+        "hora": hora_str,
+        "fecha": fecha_str,
         "tipo_clasificado": classify(a) 
     }
 
@@ -256,18 +278,23 @@ def format_intervention_with_gemini(feature):
     if gemini_model: 
         try:
             # --- 3. Llamada a Gemini para interpretación ---
-            prompt_interpret = f"""Analiza el siguiente incidente de Bombers:
-            Tipo alarma principal: {incident_data_for_gemini['tipo_alarma1']}
-            Tipo alarma secundaria: {incident_data_for_gemini['tipo_alarma2']}
-            Dotaciones: {incident_data_for_gemini['dotaciones']}
-            Fase: {incident_data_for_gemini['fase']}
-            Ubicación: {incident_data_for_gemini['ubicacion_geo']}
-            Hora: {incident_data_for_gemini['hora']}
-            Tipo (clasificación básica): {incident_data_for_gemini['tipo_clasificado']}
+            # Prompt mejorado para la ubicación y para la síntesis del tipo
+            prompt_interpret = f"""Analiza el siguiente incidente de Bombers.
+            Datos del incidente:
+            - Tipo alarma principal: {incident_data_for_gemini['tipo_alarma1']}
+            - Tipo alarma secundaria: {incident_data_for_gemini['tipo_alarma2']}
+            - Dotaciones: {incident_data_for_gemini['dotaciones']}
+            - Fase: {incident_data_for_gemini['fase']}
+            - Ubicación: {incident_data_for_gemini['ubicacion_completa']}
+            - Municipio: {incident_data_for_gemini['municipio']}
+            - Comarca: {incident_data_for_gemini['comarca']}
+            - Provincia: {incident_data_for_gemini['provincia']}
+            - Fecha y Hora: {incident_data_for_gemini['fecha']} a las {incident_data_for_gemini['hora']}
+            - Clasificación básica: {incident_data_for_gemini['tipo_clasificado']}
 
-            Proporciona un resumen conciso y descriptivo del incidente.
-            Estima su relevancia en una escala del 1 (muy bajo) al 10 (muy alto) para la población.
-            Sugiere 2-3 palabras clave o hashtags (ej. #Incendio[Municipio]) para buscar actualizaciones en Google.
+            Proporciona un resumen descriptivo del incidente (entre 3 y 5 frases), fusionando los tipos de alarma y la clasificación básica de forma natural.
+            Estima su relevancia en una escala del 1 (muy bajo, poco impacto) al 10 (muy alto, gran impacto o peligro) para la población.
+            Sugiere 2-3 palabras clave o hashtags (ej. #Incendio[Municipio], #Incendio[Tipo]) para buscar actualizaciones en Google. Asegúrate de que las palabras clave geográficas sean exactas al municipio y provincia proporcionados.
             Formato de salida (JSON, solo el objeto JSON, sin envolver en bloques de código ni texto adicional):
             {{
               "resumen": "Aquí el resumen del incidente.",
@@ -287,7 +314,7 @@ def format_intervention_with_gemini(feature):
                 gemini_relevance = int(parsed_interpret.get("relevancia", 0))
                 search_keywords = parsed_interpret.get("palabras_clave_busqueda", [])
             except json.JSONDecodeError:
-                logging.warning(f"Respuesta de Gemini no es JSON válido (después de limpieza) para interpretación: '{response_interpret.text}'. Puede que Gemini no haya seguido el formato o el JSON sea inválido.")
+                logging.warning(f"Respuesta de Gemini no es JSON válido (después de limpieza) para interpretación: '{response_interpret.text}'.")
                 gemini_interpretation = "Resumen no disponible (Gemini no devolvió JSON válido)."
                 gemini_relevance = 0
                 search_keywords = []
@@ -296,18 +323,22 @@ def format_intervention_with_gemini(feature):
 
             # --- 4. Llamada a Gemini para búsqueda (si es relevante) ---
             if gemini_relevance >= 7 and search_keywords: 
-                query = f"incendio {location_str} {' '.join(search_keywords)} últimas noticias"
+                # Consulta de búsqueda más precisa
+                query = f"incendio {incident_data_for_gemini['ubicacion_completa']} {' '.join(search_keywords)} últimas noticias"
                 logging.info(f"Realizando búsqueda con Gemini para: {query}")
                 
                 try:
                     search_response = gemini_model.generate_content(
-                        f"Resume muy concisamente (no más de 3 frases) noticias y actualizaciones sobre: '{query}'.", 
+                        f"Resume las noticias y actualizaciones más relevantes (aproximadamente 50-100 palabras) sobre: '{query}'. Enfócate en el estado actual y el impacto. Si no hay resultados relevantes, indícalo.", 
                         tools=[] 
                     )
                     
                     if search_response and search_response.text:
                          gemini_search_summary = search_response.text.strip()
-                         if "no se encontraron resultados" in gemini_search_summary.lower() or "no puedo encontrar" in gemini_search_summary.lower():
+                         # Intentar detectar si no hay resultados reales por parte de Gemini
+                         if "no se encontraron resultados" in gemini_search_summary.lower() or \
+                            "no puedo encontrar" in gemini_search_summary.lower() or \
+                            "no se encontraron noticias relevantes" in gemini_search_summary.lower():
                             gemini_search_summary = "No se encontraron actualizaciones relevantes en Google."
                          else:
                              logging.info(f"Gemini búsqueda: {gemini_search_summary}")
@@ -321,17 +352,17 @@ def format_intervention_with_gemini(feature):
             logging.error(f"Error general al interactuar con la API de Gemini: {e}")
             gemini_interpretation = f"Error al interpretar con IA: {e}"
             gemini_search_summary = "Búsqueda con IA fallida."
-    else: # Si gemini_model es None (API_KEY no configurada o inicialización fallida)
+    else: 
         logging.warning("gemini_model no está disponible. Saltando interacciones con la IA.")
 
 
     # --- 5. Construir el mensaje final para Telegram (HTML) ---
+    # La descripción del tipo ahora la hace Gemini en el 'resumen'
     telegram_message = (
-        f"🚨 <b>AVÍS BOMBERS</b> | {location_str} 🚨\n\n"
-        f"<b>Tipus:</b> {classify(a).capitalize()} ({a.get('TAL_DESC_ALARMA1', '')} {a.get('TAL_DESC_ALARMA2', '')})\n"
-        f"<b>Hora:</b> {hora} | <b>Dotacions:</b> {a.get('ACT_NUM_VEH')} | <b>Fase:</b> {a.get('COM_FASE', 'Desconeguda')}\n"
+        f"🚨 <b>AVÍS BOMBERS</b> | {incident_data_for_gemini['ubicacion_completa']} 🚨\n\n"
+        f"<b>Fecha:</b> {fecha_str} | <b>Hora:</b> {hora_str} | <b>Dotaciones:</b> {a.get('ACT_NUM_VEH')} | <b>Fase:</b> {a.get('COM_FASE', 'Desconeguda')}\n"
         f"<b>Relevancia IA:</b> {gemini_relevance}/10\n\n"
-        f"<i>Resumen IA:</i> {gemini_interpretation}\n\n"
+        f"<i>Resumen IA:</i> {gemini_interpretation}\n\n" # El resumen ya debería incluir el tipo natural
     )
     
     if gemini_relevance >= 7 and gemini_search_summary and "no se encontraron actualizaciones relevantes" not in gemini_search_summary:
@@ -339,7 +370,7 @@ def format_intervention_with_gemini(feature):
     
     telegram_message += f"🌐 <a href='{MAPA_OFICIAL}'>Mapa Oficial Bombers</a>"
 
-    return telegram_message, gemini_relevance # Devolver también la relevancia
+    return telegram_message, gemini_relevance, timestamp_ms # Devolver también la relevancia y timestamp para ordenar
 
 # --- Funciones de envío ---
 def send_telegram_message(text):
@@ -381,16 +412,13 @@ def send(text, api=None):
 
 # --- MAIN ---
 def main():
-    # Cargar el estado de los incidentes procesados
     last_id = load_state()
 
-    # --- INICIO BLOQUE DE DIAGNÓSTICO Y ASIGNACIÓN DE MODELO GEMINI ---
     global gemini_model 
     if GEMINI_API_KEY:
         try:
-            # Si gemini_model ya se inicializó arriba sin error, no intentamos de nuevo.
-            # Solo listamos modelos si gemini_model ya es un objeto válido.
-            if gemini_model is None: # Si falló en la inicialización global, intentamos de nuevo aquí con más logs.
+            logging.info("Intentando listar modelos de Gemini disponibles para confirmación...")
+            if gemini_model is None: 
                 logging.error("gemini_model no se inicializó globalmente. Intentando re-inicializar y listar modelos.")
                 gemini_model = genai.GenerativeModel(
                     'models/gemini-1.5-flash',
@@ -398,40 +426,32 @@ def main():
                 )
                 logging.info("Modelo 'models/gemini-1.5-flash' re-inicializado con éxito en main().")
 
-            # Ahora que gemini_model_ ha sido (re)inicializado, listamos modelos si es válido.
             if gemini_model:
-                logging.info("Intentando listar modelos de Gemini disponibles para confirmación...")
                 found_target_model = False
                 available_models_for_gc = [] 
                 
                 for m in genai.list_models():
                     if 'generateContent' in m.supported_generation_methods:
                         available_models_for_gc.append(m.name)
-                        logging.info(f"Modelo disponible para generateContent: {m.name}")
                         if m.name == 'models/gemini-1.5-flash': 
                             found_target_model = True
-                    else:
-                        logging.info(f"Modelo no soportado para generateContent: {m.name}")
                 
                 if not found_target_model:
                     logging.warning(f"El modelo objetivo 'models/gemini-1.5-flash' NO está en la lista de modelos disponibles para generateContent.")
                     logging.warning(f"Modelos compatibles: {', '.join(available_models_for_gc) if available_models_for_gc else 'Ninguno'}")
                     logging.warning("Se continuará sin este modelo si no se pudo inicializar.")
-                    # Si no encontramos el modelo objetivo, nos aseguramos de que gemini_model sea None
-                    # para que format_intervention_with_gemini lo sepa.
                     gemini_model = None 
                 
                 logging.info("Listado de modelos de Gemini completado.")
             else:
                 logging.warning("gemini_model sigue siendo None después de la inicialización y/o re-inicialización. No se listarán modelos.")
 
-        except Exception as e: # Captura errores durante el listado o re-inicialización en main()
+        except Exception as e:
             logging.error(f"Error crítico en el bloque de diagnóstico/inicialización de Gemini en main(): {e}.")
-            gemini_model = None # Asegurarse de que el modelo es None si falla el diagnóstico
+            gemini_model = None 
     else:
         logging.warning("GEMINI_API_KEY no configurada. Saltando verificación de modelos Gemini y operaciones de IA.")
         gemini_model = None 
-    # --- FIN BLOQUE DE DIAGNÓSTICO Y ASIGNACIÓN DE MODELO GEMINI ---
 
 
     feats = fetch_features()
@@ -445,72 +465,64 @@ def main():
         logging.info("No hay intervenciones nuevas para procesar.")
         return
 
-    max_id_to_save = last_id 
-    
-    # --- INICIO: Lógica de priorización y envío ---
-    processed_incidents = []
+    # --- INICIO: Lógica de priorización y envío (revisada) ---
+    all_processed_new_feats = []
 
-    # Procesar todas las nuevas actuaciones con Gemini para obtener su relevancia
+    # 1. Procesar todas las nuevas actuaciones con Gemini para obtener su relevancia y mensaje
     for feature in new_feats:
         current_object_id = feature["attributes"].get("ESRI_OID")
+        # format_intervention_with_gemini ahora devuelve mensaje, relevancia y timestamp
+        telegram_message, relevance, timestamp = format_intervention_with_gemini(feature)
         
-        # format_intervention_with_gemini ahora devuelve el mensaje Y la relevancia
-        telegram_message, relevance = format_intervention_with_gemini(feature)
-        
-        processed_incidents.append({
-            "feature": feature,
+        all_processed_new_feats.append({
+            "object_id": current_object_id,
             "message": telegram_message,
             "relevance": relevance,
-            "object_id": current_object_id,
-            "timestamp": feature["attributes"].get("ACT_DAT_ACTUACIO", 0) 
+            "timestamp": timestamp
         })
         
-        # Actualizar el max_id_to_save independientemente de si se va a enviar o no
-        if current_object_id:
-             max_id_to_save = max(max_id_to_save, current_object_id)
-        
-        time.sleep(0.5) 
+        time.sleep(0.5) # Pausa entre llamadas a Gemini
 
-    # --- Lógica de selección de mensajes a enviar ---
+    # 2. Ordenar las actuaciones procesadas para seleccionar
+    # Ordenar por fecha de actuación para encontrar la más reciente general
+    all_processed_new_feats.sort(key=lambda x: x["timestamp"], reverse=True)
+
     messages_to_send_final = []
-    sent_object_ids = set() # Para evitar duplicados
+    sent_object_ids = set() # Para evitar enviar el mismo incidente dos veces
 
-    # 1. Identificar y añadir la actuación NUEVA más reciente
-    most_recent_incident_processed = None
-    if processed_incidents:
-        # Asegurarse de que processed_incidents está ordenado por timestamp descendente
-        processed_incidents.sort(key=lambda x: x["timestamp"], reverse=True)
-        most_recent_incident_processed = processed_incidents[0]
-    
-    if most_recent_incident_processed:
-        messages_to_send_final.append(most_recent_incident_processed["message"])
-        sent_object_ids.add(most_recent_incident_processed["object_id"])
-        logging.info(f"Añadida la actuación nueva más reciente (ID: {most_recent_incident_processed['object_id']}) a la cola de envío.")
+    MAX_TOTAL_MESSAGES_PER_RUN = 3 # Número máximo de mensajes a enviar por ejecución
+    MIN_RELEVANCE_FOR_IMPORTANT = 7 # Umbral de relevancia IA para considerar "importante"
 
-    # 2. Filtrar y añadir actuaciones importantes (relevancia >= 7), excluyendo la ya enviada
+    # --- Añadir la actuación NUEVA más reciente (si existe) ---
+    if all_processed_new_feats:
+        most_recent_incident = all_processed_new_feats[0]
+        messages_to_send_final.append(most_recent_incident["message"])
+        sent_object_ids.add(most_recent_incident["object_id"])
+        logging.info(f"Añadida la actuación nueva más reciente (ID: {most_recent_incident['object_id']}) a la cola de envío.")
+
+    # --- Añadir actuaciones importantes (relevancia >= MIN_RELEVANCE_FOR_IMPORTANT) ---
+    # Filtrar aquellas que son importantes y que no hayan sido ya la "más reciente"
     important_incidents_filtered = [
-        inc for inc in processed_incidents 
-        if inc["relevance"] >= 7 and inc["object_id"] not in sent_object_ids
+        inc for inc in all_processed_new_feats 
+        if inc["relevance"] >= MIN_RELEVANCE_FOR_IMPORTANT and inc["object_id"] not in sent_object_ids
     ]
 
-    # Ordenar las importantes por relevancia (descendente) y luego por fecha (descendente)
+    # Ordenar las importantes: primero por relevancia (desc), luego por fecha (desc)
     important_incidents_filtered.sort(key=lambda x: (x["relevance"], x["timestamp"]), reverse=True)
 
-    # Limitar el número total de mensajes a enviar (ej. 3 mensajes en total: 1 reciente + 2 importantes)
-    MAX_TOTAL_MESSAGES_PER_RUN = 3
-    current_messages_sent_count = len(messages_to_send_final)
-
+    # Añadir al resto de la lista hasta el límite
+    current_messages_count = len(messages_to_send_final)
     for incident in important_incidents_filtered:
-        if current_messages_sent_count < MAX_TOTAL_MESSAGES_PER_RUN:
+        if current_messages_count < MAX_TOTAL_MESSAGES_PER_RUN:
             messages_to_send_final.append(incident["message"])
             sent_object_ids.add(incident["object_id"])
             logging.info(f"Añadida actuación importante (ID: {incident['object_id']}, Relevancia: {incident['relevance']}) a la cola de envío.")
-            current_messages_sent_count += 1
+            current_messages_count += 1
         else:
-            break # Si ya alcanzamos el límite, no añadir más
+            break # Límite de mensajes alcanzado
 
     if not messages_to_send_final:
-        logging.info("No hay actuaciones nuevas que superen los criterios para ser enviadas.")
+        logging.info("No hay actuaciones nuevas que cumplan los criterios para ser enviadas.")
         
     # --- Envío de los mensajes finales ---
     for message_content in messages_to_send_final:
@@ -518,6 +530,12 @@ def main():
         time.sleep(1) # Pausa entre envíos de mensajes a Telegram
 
     # --- FIN: Lógica de priorización y envío ---
+
+    # Actualizar last_id con el ID más alto de TODAS las nuevas actuaciones procesadas
+    # Esto asegura que no se reprocesen en la siguiente ejecución.
+    max_id_to_save = last_id
+    if new_feats: 
+        max_id_to_save = max(max_id_to_save, max(f["attributes"].get("ESRI_OID", 0) for f in new_feats if f["attributes"].get("ESRI_OID")))
     
     save_state(max_id_to_save)
 
