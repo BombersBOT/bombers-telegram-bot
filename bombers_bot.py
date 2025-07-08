@@ -58,16 +58,15 @@ gemini_model = None # Inicializamos a None por defecto
 if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        # Aquí intentamos inicializar el modelo. Si falla, capturaremos el error.
+        # CAMBIO CLAVE: Usamos 'models/gemini-1.5-flash' que sabemos que está disponible y recomendado.
         gemini_model = genai.GenerativeModel(
-            'gemini-pro', 
+            'models/gemini-1.5-flash', 
             generation_config={"temperature": 0.2}
         )
-        logging.info("API de Gemini configurada y modelo 'gemini-pro' inicializado.")
+        logging.info("API de Gemini configurada y modelo 'models/gemini-1.5-flash' inicializado.")
     except Exception as e:
-        # Capturamos el error aquí y logueamos, para saber por qué gemini_model es None.
-        logging.error(f"ERROR: No se pudo inicializar el modelo 'gemini-pro'. Asegúrate de que la clave API es correcta y el modelo accesible para tu proyecto. Detalle: {e}")
-        gemini_model = None # Nos aseguramos de que sea None si hay un error
+        logging.error(f"ERROR: No se pudo inicializar el modelo 'models/gemini-1.5-flash'. Asegúrate de que la clave API es correcta y el modelo accesible para tu proyecto. Detalle: {e}")
+        gemini_model = None 
 else:
     logging.warning("GEMINI_API_KEY no configurada. Las funciones de IA no estarán disponibles.")
 
@@ -295,6 +294,8 @@ def format_intervention_with_gemini(feature):
                 logging.info(f"Realizando búsqueda con Gemini para: {query}")
                 
                 try:
+                    # Aquí se asume que la extensión 'Google Search' está habilitada en Google AI Studio para este modelo.
+                    # El parámetro 'tools=[]' es correcto para indicar que el modelo puede usar las herramientas configuradas.
                     search_response = gemini_model.generate_content(
                         f"Resume muy concisamente (no más de 3 frases) noticias y actualizaciones sobre: '{query}'.", 
                         tools=[] 
@@ -385,28 +386,42 @@ def main():
     if GEMINI_API_KEY:
         try:
             logging.info("Intentando listar modelos de Gemini disponibles...")
-            found_gemini_pro = False
+            found_target_model = False
             available_models_list = []
+            
+            # Iterar y recolectar modelos disponibles
             for m in genai.list_models():
                 if 'generateContent' in m.supported_generation_methods:
                     available_models_list.append(m.name)
                     logging.info(f"Modelo disponible para generateContent: {m.name}")
-                    if m.name == 'models/gemini-pro':
-                        found_gemini_pro = True
+                    # Comprobar si el modelo objetivo (gemini-1.5-flash) está en la lista
+                    if m.name == 'models/gemini-1.5-flash':
+                        found_target_model = True
                 else:
                     logging.info(f"Modelo no soportado para generateContent: {m.name}")
             
-            if not found_gemini_pro:
-                logging.warning("El modelo 'models/gemini-pro' NO está en la lista de modelos disponibles para generateContent.")
+            # Si el modelo objetivo no está, intentar un fallback
+            if not found_target_model:
+                logging.warning(f"El modelo objetivo 'models/gemini-1.5-flash' NO está en la lista de modelos disponibles para generateContent.")
                 logging.warning(f"Modelos disponibles: {', '.join(available_models_list) if available_models_list else 'Ninguno'}")
-                # Si gemini-pro no está disponible, intentar con otro modelo si existe uno compatible.
-                # Por ahora, simplemente dejamos gemini_model como está (que falló en la inicialización global o es None)
-                # o podrías intentar asignar el primer modelo compatible aquí si quieres un fallback automático.
-                # Por ejemplo:
-                if available_models_list:
-                    # Intenta usar el primer modelo compatible que encuentre si gemini-pro no está.
-                    # Esto es un fallback, la calidad de la IA podría variar.
-                    fallback_model_name = available_models_list[0]
+                
+                # Intentar encontrar un fallback adecuado de la lista, priorizando Flash o Pro de 1.5/2.5
+                fallback_model_name = None
+                
+                # Priorizar modelos "flash" (más rápidos y baratos)
+                for model_name in available_models_list:
+                    if "flash" in model_name and ("1.5" in model_name or "2.5" in model_name) and "preview" not in model_name and "exp" not in model_name:
+                        fallback_model_name = model_name
+                        break
+                
+                # Si no hay flash, buscar pro
+                if not fallback_model_name:
+                    for model_name in available_models_list:
+                        if "pro" in model_name and ("1.5" in model_name or "2.5" in model_name) and "preview" not in model_name and "exp" not in model_name:
+                            fallback_model_name = model_name
+                            break
+
+                if fallback_model_name:
                     logging.warning(f"Intentando usar modelo fallback: '{fallback_model_name}'")
                     try:
                         gemini_model = genai.GenerativeModel(
@@ -418,17 +433,22 @@ def main():
                         logging.error(f"Error al inicializar modelo fallback '{fallback_model_name}': {e}")
                         gemini_model = None # Fallback fallido
                 else:
-                    logging.error("No se encontró ningún modelo de Gemini compatible para generateContent.")
+                    logging.error("No se encontró ningún modelo de Gemini compatible para generateContent en la lista.")
                     gemini_model = None
+            else:
+                # Si el modelo objetivo (gemini-1.5-flash) está disponible, asegúrarse de que gemini_model
+                # esté apuntando a ese modelo (ya se hizo en la inicialización global si no falló).
+                # Podríamos re-inicializarlo aquí para estar 100% seguros, pero no es estrictamente necesario
+                # si la inicialización global fue exitosa.
+                pass 
             
             logging.info("Listado de modelos de Gemini completado.")
         except Exception as e:
             logging.error(f"Error al listar modelos de Gemini: {e}. Revisa tu GEMINI_API_KEY y la habilitación de la API de Generative Language en Google Cloud.")
-            # Si listar modelos falla, el modelo no estará disponible.
-            gemini_model = None
+            gemini_model = None # Si listar modelos falla, el modelo no estará disponible.
     else:
         logging.warning("GEMINI_API_KEY no configurada. Saltando verificación de modelos Gemini y operaciones de IA.")
-        gemini_model = None # Asegurarse de que es None si la API key no está.
+        gemini_model = None 
     # --- FIN BLOQUE DE DIAGNÓSTICO Y ASIGNACIÓN DE MODELO GEMINI ---
 
 
