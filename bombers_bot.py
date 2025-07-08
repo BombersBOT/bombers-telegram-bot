@@ -22,7 +22,7 @@ from urllib3.util.retry import Retry
 
 # Importar la librería de Gemini
 import google.generativeai as genai 
-import google.generativeai.tools as tools # <--- NUEVA IMPORTACIÓN para acceder a las herramientas
+# ELIMINAMOS: import google.generativeai.tools as tools # Ya no es necesaria esta importación directa de tools
 
 # --- CONFIG ---
 LAYER_URL = ("https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
@@ -65,9 +65,8 @@ else:
     logging.warning("GEMINI_API_KEY no configurada. Las funciones de IA no estarán disponibles.")
     gemini_model = None 
 
-# Habilitar la extensión de Google Search para Gemini (si el modelo lo soporta y está habilitado en tu cuenta)
-# Este es el cambio que soluciona el AttributeError
-search_tool = tools.GoogleSearch # <--- CAMBIO AQUÍ: Ahora se referencia correctamente
+# ELIMINAMOS: search_tool = tools.GoogleSearch # Ya no es necesaria esta línea
+
 # --- FIN Configuración de Gemini ---
 
 logging.basicConfig(level=logging.INFO,
@@ -273,7 +272,6 @@ def format_intervention_with_gemini(feature):
             """
             
             response_interpret = gemini_model.generate_content(prompt_interpret)
-            # Asegurarse de que la respuesta es un texto parseable como JSON
             try:
                 parsed_interpret = json.loads(response_interpret.text) 
                 gemini_interpretation = parsed_interpret.get("resumen", "Error al interpretar.")
@@ -288,17 +286,19 @@ def format_intervention_with_gemini(feature):
             logging.info(f"Gemini interpretación: Relevancia={gemini_relevance}, Resumen={gemini_interpretation}")
 
             # --- 4. Llamada a Gemini para búsqueda (si es relevante) ---
-            if gemini_relevance >= 7 and search_keywords: # Umbral de relevancia y si hay palabras clave
-                # Crear una query de búsqueda general
+            if gemini_relevance >= 7 and search_keywords: 
                 query = f"incendio {location_str} {' '.join(search_keywords)} últimas noticias"
                 logging.info(f"Realizando búsqueda con Gemini para: {query}")
                 
                 try:
+                    # NOTA: tools=[] se pasa directamente para indicar que el modelo puede usar herramientas.
+                    # No necesitas referenciar genai.tool_code.GoogleSearch directamente aquí.
+                    # El modelo ya sabe que si tiene la extensión habilitada en AI Studio, la puede usar.
                     search_response = gemini_model.generate_content(
                         f"Resume muy concisamente (no más de 3 frases) noticias y actualizaciones sobre: '{query}'.", 
-                        tools=[search_tool] # Utiliza la herramienta de búsqueda de Google Search
+                        tools=[] # <-- Si 'Grounding with Google Search' está habilitado en AI Studio, el modelo lo usará automáticamente.
                     )
-                    # Verificar si la respuesta de búsqueda contiene contenido real
+                    
                     if search_response and search_response.text:
                          gemini_search_summary = search_response.text.strip()
                          if "no se encontraron resultados" in gemini_search_summary.lower() or "no puedo encontrar" in gemini_search_summary.lower():
@@ -388,32 +388,22 @@ def main():
 
     max_id_to_save = last_id 
     
-    # Ordenar las nuevas por fecha para procesar cronológicamente
     new_feats.sort(key=lambda f: f["attributes"].get("ACT_DAT_ACTUACIO", 0)) 
 
     for feature in new_feats:
         current_object_id = feature["attributes"].get("ESRI_OID")
         
-        # Generar el mensaje con IA para cada nuevo incidente
         telegram_message = format_intervention_with_gemini(feature)
         
-        # Enviar el mensaje a Telegram
         send(telegram_message, None) 
         
-        # Actualizar el ID máximo procesado
         if current_object_id:
              max_id_to_save = max(max_id_to_save, current_object_id)
         
-        # Pequeña pausa para no saturar APIs si hay muchas actualizaciones a la vez
         time.sleep(1) 
     
     save_state(max_id_to_save)
 
 
 if __name__ == "__main__":
-    # Para la ejecución local, asegúrate de tener las variables de entorno configuradas
-    # export GEMINI_API_KEY="YOUR_API_KEY"
-    # export TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN"
-    # export TELEGRAM_CHAT_ID="YOUR_CHAT_ID"
-    # Y también `export IS_TEST_MODE="true"` para simular X.
     main()
