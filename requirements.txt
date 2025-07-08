@@ -3,3 +3,4 @@ requests
 geopy
 pyproj
 pytz
+google-generativeai
