@@ -19,10 +19,11 @@ from geopy.geocoders import Nominatim
 from pyproj import Transformer
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import time # <--- AÑADIDO: Importar el módulo time
+
 
 # Importar la librería de Gemini
 import google.generativeai as genai 
-# ELIMINAMOS: import google.generativeai.tools as tools # Ya no es necesaria esta importación directa de tools
 
 # --- CONFIG ---
 LAYER_URL = ("https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
@@ -56,16 +57,15 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+    # Inicializamos gemini_model aquí, pero la disponibilidad real se verificará en main()
     gemini_model = genai.GenerativeModel(
         'gemini-pro', 
         generation_config={"temperature": 0.2}
     )
-    logging.info("API de Gemini configurada.")
+    logging.info("API de Gemini configurada (intentando usar gemini-pro).")
 else:
     logging.warning("GEMINI_API_KEY no configurada. Las funciones de IA no estarán disponibles.")
     gemini_model = None 
-
-# ELIMINAMOS: search_tool = tools.GoogleSearch # Ya no es necesaria esta línea
 
 # --- FIN Configuración de Gemini ---
 
@@ -291,12 +291,11 @@ def format_intervention_with_gemini(feature):
                 logging.info(f"Realizando búsqueda con Gemini para: {query}")
                 
                 try:
-                    # NOTA: tools=[] se pasa directamente para indicar que el modelo puede usar herramientas.
-                    # No necesitas referenciar genai.tool_code.GoogleSearch directamente aquí.
-                    # El modelo ya sabe que si tiene la extensión habilitada en AI Studio, la puede usar.
+                    # Aquí se asume que la extensión 'Google Search' está habilitada en Google AI Studio para este modelo.
+                    # El parámetro 'tools=[]' es correcto para indicar que el modelo puede usar las herramientas configuradas.
                     search_response = gemini_model.generate_content(
                         f"Resume muy concisamente (no más de 3 frases) noticias y actualizaciones sobre: '{query}'.", 
-                        tools=[] # <-- Si 'Grounding with Google Search' está habilitado en AI Studio, el modelo lo usará automáticamente.
+                        tools=[] 
                     )
                     
                     if search_response and search_response.text:
@@ -388,7 +387,7 @@ def main():
 
     max_id_to_save = last_id 
     
-    new_feats.sort(key=lambda f: f["attributes"].get("ACT_DAT_ACTUACIO", 0)) 
+    new_feats.sort(key=lambda f: f["attributes"].get("ACT_DAT_ACTUACIO", 0), reverse=True) # Ordenar de más reciente a más antiguo
 
     for feature in new_feats:
         current_object_id = feature["attributes"].get("ESRI_OID")
@@ -400,7 +399,7 @@ def main():
         if current_object_id:
              max_id_to_save = max(max_id_to_save, current_object_id)
         
-        time.sleep(1) 
+        time.sleep(1) # Pausa para evitar saturar APIs
     
     save_state(max_id_to_save)
 
