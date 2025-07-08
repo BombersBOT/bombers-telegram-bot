@@ -8,7 +8,7 @@ Publica (o simula) las intervenciones de Bombers priorizando:
 Ahora integra IA (Gemini) para interpretar datos y buscar actualizaciones.
 
 Requisitos:
-    requests    geopy    pyproj    google-generativeai
+    requests    geopy    pyproj    google-generativeai    google-api-python-client
 """
 
 import os, json, logging, requests
@@ -21,8 +21,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import time 
 
-# Importar la librería de Gemini
+# Importar las librerías de Google
 import google.generativeai as genai 
+from googleapiclient.discovery import build # Para la API de Google Custom Search
 
 # --- CONFIG ---
 LAYER_URL = ("https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
@@ -38,7 +39,7 @@ STATE_FILE = Path("state.json")
 GEOCODER   = Nominatim(user_agent="bombers_bot")
 TRANSFORM  = Transformer.from_crs(25831, 4326, always_xy=True)
 
-# Credenciales de X (Twitter) - Se mantienen para compatibilidad, pero no se usan para publicar
+# Credenciales de X (Twitter) - Se mantienen, pero no se usan para publicar
 TW_KEYS = {
     "ck": os.getenv("TW_CONSUMER_KEY"),
     "cs": os.getenv("TW_CONSUMER_SECRET"),
@@ -70,7 +71,20 @@ else:
     logging.warning("GEMINI_API_KEY no configurada. Las funciones de IA no estarán disponibles.")
     gemini_model = None 
 
-# --- FIN Configuración de Gemini ---
+# --- Configuración de Google Custom Search ---
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID") # <-- NUEVA VARIABLE DE ENTORNO
+Google Search_service = None
+if GOOGLE_CSE_ID and GEMINI_API_KEY: # Reusa la GEMINI_API_KEY para la búsqueda si es la misma
+    try:
+        Google Search_service = build("customsearch", "v1", developerKey=GEMINI_API_KEY)
+        logging.info("Servicio de Google Custom Search inicializado.")
+    except Exception as e:
+        logging.error(f"ERROR: No se pudo inicializar el servicio de Google Custom Search. Detalle: {e}")
+        Google Search_service = None
+else:
+    logging.warning("GOOGLE_CSE_ID o GEMINI_API_KEY no configurados. La búsqueda en Google no estará disponible.")
+
+# --- FIN Configuración de Google Custom Search ---
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -206,10 +220,32 @@ def get_address_components_from_coords(geom):
     return {"street": street, "municipality": municipality, "comarca": comarca, "provincia": provincia}
 
 
+def perform_google_cse_search(query_string):
+    """Realiza una búsqueda usando la API de Google Custom Search y devuelve los resultados."""
+    if not Google Search_service:
+        logging.warning("Servicio de Google Custom Search no inicializado. No se puede realizar la búsqueda.")
+        return []
+
+    try:
+        # Pide los primeros 5 resultados, ajusta según necesidad
+        res = Google Search_service.cse().list(q=query_string, cx=GOOGLE_CSE_ID, num=5).execute()
+        
+        search_results_text = []
+        if 'items' in res:
+            for item in res['items']:
+                search_results_text.append(f"Título: {item.get('title', 'N/A')}\nURL: {item.get('link', 'N/A')}\nSnippet: {item.get('snippet', 'N/A')}\n---")
+        
+        logging.info(f"Búsqueda CSE para '{query_string}' obtuvo {len(res.get('items',[]))} resultados.")
+        return search_results_text
+    except Exception as e:
+        logging.error(f"Error al llamar a Google Custom Search API para '{query_string}': {e}")
+        return []
+
+
 def format_intervention_with_gemini(feature):
     """
-    Formatea la intervención usando los datos de ArcGIS y Gemini para interpretación y búsqueda.
-    Devuelve el mensaje de Telegram, la relevancia y las palabras clave.
+    Formatea la intervención usando los datos de ArcGIS, Gemini para interpretación,
+    y Google Custom Search para la búsqueda.
     """
     a = feature["attributes"]
     geom = feature.get("geometry")
@@ -227,11 +263,11 @@ def format_intervention_with_gemini(feature):
     provincia_geocoded = calle_geocoded_data["provincia"] if calle_geocoded_data["provincia"] else ""
 
 
-    # Construir location_str lo más completo posible para Gemini
     location_parts = []
     if calle_final: 
         location_parts.append(calle_final)
     
+    # Intenta usar la ubicación completa de ArcGIS si está disponible y es fiable
     if _full_location_from_arcgis_success: 
         if municipio_arcgis and municipio_arcgis not in location_parts:
             location_parts.append(municipio_arcgis)
@@ -274,13 +310,13 @@ def format_intervention_with_gemini(feature):
 
     gemini_interpretation = "No disponible (IA no configurada o error)."
     gemini_relevance = 0
-    gemini_search_summary = "No se encontraron actualizaciones en Google (IA no configurada o no relevante)."
+    gemini_search_summary = "No se encontraron actualizaciones relevantes en Google." # Texto por defecto
     search_keywords = [] 
 
     if gemini_model: 
         try:
             # --- 3. Llamada a Gemini para interpretación ---
-            # Prompt mejorado: mayor detalle, síntesis del tipo, precisión geográfica, JSON puro.
+            # Prompt para interpretación: Genera resumen, relevancia y palabras clave
             prompt_interpret = f"""Analiza el siguiente incidente de Bombers y proporciona un resumen descriptivo e informativo.
             Datos del incidente:
             - Tipo alarma principal de Bombers: {incident_data_for_gemini['tipo_alarma1']}
@@ -325,44 +361,54 @@ def format_intervention_with_gemini(feature):
 
             logging.info(f"Gemini interpretación: Relevancia={gemini_relevance}, Resumen={gemini_interpretation}")
 
-            # --- 4. Llamada a Gemini para búsqueda (si es relevante) ---
-            if gemini_relevance >= 7 and search_keywords: 
-                # Consulta de búsqueda más precisa: utiliza todos los componentes geográficos conocidos.
-                search_geo_parts = []
-                if incident_data_for_gemini['municipio']: search_geo_parts.append(incident_data_for_gemini['municipio'])
-                if incident_data_for_gemini['comarca']: search_geo_parts.append(incident_data_for_gemini['comarca'])
-                if incident_data_for_gemini['provincia']: search_geo_parts.append(incident_data_for_gemini['provincia'])
+            # --- 4. Realizar búsqueda en Google Custom Search API y luego resumir con Gemini ---
+            if gemini_relevance >= 7 and Google Search_service: # Solo buscar si es relevante y el servicio CSE está activo
                 
-                base_query_geo = " ".join(search_geo_parts) if search_geo_parts else location_str
+                # Construir la query para Google Custom Search - Más amplia y flexible
+                cse_query_parts = []
+                if incident_data_for_gemini['municipio']: cse_query_parts.append(incident_data_for_gemini['municipio'])
+                if incident_data_for_gemini['comarca']: cse_query_parts.append(incident_data_for_gemini['comarca'])
+                if incident_data_for_gemini['provincia']: cse_query_parts.append(incident_data_for_gemini['provincia'])
                 
-                # Prompts ajustados para búsqueda: más general, y explícitamente pide si no hay resultados.
-                query = f"incendio {base_query_geo} {' '.join(search_keywords)} noticias" # Eliminado "última hora"
-                logging.info(f"Realizando búsqueda con Gemini para: {query}")
-                
-                try:
-                    search_response = gemini_model.generate_content(
-                        f"Resume las noticias y actualizaciones más relevantes (aproximadamente 50-100 palabras) sobre: '{query}'. Enfócate en el estado actual, el impacto y si hay personas afectadas. Si la búsqueda no arroja resultados significativos o específicos del incidente, indica claramente 'No se encontraron actualizaciones relevantes en Google'.", 
-                        tools=[] 
-                    )
-                    
-                    if search_response and search_response.text:
-                         gemini_search_summary = search_response.text.strip()
-                         # Criterios más amplios para detectar "no resultados"
-                         if "no se encontraron resultados" in gemini_search_summary.lower() or \
-                            "no puedo encontrar" in gemini_search_summary.lower() or \
-                            "no se encontraron noticias relevantes" in gemini_search_summary.lower() or \
-                            "no hay información disponible" in gemini_search_summary.lower() or \
-                            "no hay resultados relevantes" in gemini_search_summary.lower() or \
-                            "no se encontraron detalles específicos" in gemini_search_summary.lower(): # <-- Ampliado
+                base_cse_query = "incendio " + " ".join(cse_query_parts) if cse_query_parts else "incendio"
+                # Añadimos palabras clave generales y específicas
+                cse_query = f"{base_cse_query} {' '.join(search_keywords)} noticia actual" # Añadir "noticia actual" para balancear
+
+                logging.info(f"Realizando búsqueda externa en Google CSE para: '{cse_query}'")
+                search_results = perform_google_cse_search(cse_query) # Llama a la nueva función de búsqueda CSE
+
+                if search_results:
+                    # Si hay resultados, pedir a Gemini que los resuma
+                    results_text = "\n".join(search_results)
+                    prompt_search_summary = f"""Has realizado la siguiente búsqueda en Google: '{cse_query}'.
+                    Aquí están los resultados crudos de la búsqueda:
+                    ---
+                    {results_text}
+                    ---
+                    Basándote SÓLO en estos resultados proporcionados, resume las noticias más relevantes (aproximadamente 50-100 palabras) sobre el incidente de Bombers. Enfócate en el estado actual, el impacto y si hay personas afectadas. Si los resultados no contienen información relevante o específica sobre el incidente, indica 'No se encontraron actualizaciones relevantes en Google'. No generes información que no esté en los resultados.
+                    """
+                    try:
+                        summary_response = gemini_model.generate_content(prompt_search_summary)
+                        gemini_search_summary = summary_response.text.strip()
+                        # Si Gemini sigue dando "no encontrados" basados en los resultados,
+                        # mantenemos nuestro mensaje por defecto si es muy genérico.
+                        if "no se encontraron actualizaciones relevantes" in gemini_search_summary.lower() or \
+                           "no se encontró información" in gemini_search_summary.lower() or \
+                           "no puedo encontrar" in gemini_search_summary.lower() or \
+                           "no se encontraron resultados" in gemini_search_summary.lower():
                             gemini_search_summary = "No se encontraron actualizaciones relevantes en Google."
-                         else:
-                             logging.info(f"Gemini búsqueda: {gemini_search_summary}")
-                    else:
-                        gemini_search_summary = "Búsqueda con IA fallida o sin resultados."
-                except Exception as search_e:
-                    logging.error(f"Error al realizar búsqueda con Gemini: {search_e}")
-                    gemini_search_summary = "Búsqueda con IA fallida."
-            
+                        else:
+                            logging.info(f"Gemini (resumen CSE): {gemini_search_summary}")
+                    except Exception as summary_e:
+                        logging.error(f"Error al pedir resumen de búsqueda a Gemini: {summary_e}")
+                        gemini_search_summary = "Error al resumir búsqueda con IA."
+                else:
+                    logging.info(f"Google CSE no devolvió resultados para: '{cse_query}'")
+                    gemini_search_summary = "No se encontraron actualizaciones relevantes en Google."
+            else:
+                logging.info("Búsqueda no realizada: Relevancia IA < 7 o servicio CSE no activo.")
+                gemini_search_summary = "No se encontraron actualizaciones relevantes en Google." # Mantiene default
+
         except Exception as e: 
             logging.error(f"Error general al interactuar con la API de Gemini: {e}")
             gemini_interpretation = f"Error al interpretar con IA: {e}"
