@@ -93,6 +93,7 @@ def fetch_features(limit=100):
     params = {
         "f": "json",
         "where": "1=1",
+        # Incluimos COM_NOM_COMARCA y PRO_NOM_PROVINCIA para mejorar la precisión geográfica
         "outFields": (
             "ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
             "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM_MUNICIPI,"
@@ -114,8 +115,10 @@ def fetch_features(limit=100):
         return []
     except requests.exceptions.RequestException as e:
         logging.error(f"Error de conexión al consultar ArcGIS: {e}")
+        # Lógica de fallback si la consulta inicial falla (ej. por campos)
         if "400" in str(e) and "Invalid query parameters" in str(e):
             logging.warning("Error 400 al obtener campos de ubicación de ArcGIS. Intentando sin ellos.")
+            # Si la consulta con campos de ubicación falla, hacemos un fallback sin ellos.
             params["outFields"] = ("ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
                                    "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
             try:
@@ -123,6 +126,7 @@ def fetch_features(limit=100):
                 r.raise_for_status()
                 data = r.json()
                 for feature in data.get("features", []):
+                    # Marcamos que la ubicación no vino completa de ArcGIS
                     feature["attributes"]["_full_location_from_arcgis_success"] = False 
                 return data.get("features", [])
             except requests.exceptions.RequestException as e_fallback:
@@ -133,22 +137,24 @@ def fetch_features(limit=100):
     data = r.json()
     if "error" in data:
         logging.error("ArcGIS devolvió un error en los datos: %s", data["error"]["message"])
+        # Otro fallback si el error viene en el JSON de datos
         if data["error"]["code"] == 400 and "Invalid query parameters" in data["error"]["message"]:
-            logging.warning("Error 400 al obtener campos de ubicación de ArcGIS. Intentando sin ellos. (Post-JSON parse)")
-            params["outFields"] = ("ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
+             logging.warning("Error 400 al obtener campos de ubicación de ArcGIS. Intentando sin ellos. (Post-JSON parse)")
+             params["outFields"] = ("ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
                                    "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
-            try:
+             try:
                 r = session.get(f"{LAYER_URL}/query", params=params, timeout=30)
                 r.raise_for_status()
                 data = r.json()
                 for feature in data.get("features", []):
                     feature["attributes"]["_full_location_from_arcgis_success"] = False
                 return data.get("features", [])
-            except requests.exceptions.RequestException as e_fallback:
+             except requests.exceptions.RequestException as e_fallback:
                 logging.error(f"Error en fallback de ArcGIS: {e_fallback}")
                 return []
         return []
     
+    # Marcamos que la ubicación completa SÍ vino de ArcGIS
     for feature in data.get("features", []):
         feature["attributes"]["_full_location_from_arcgis_success"] = True
     return data.get("features", [])
@@ -176,6 +182,8 @@ def utm_to_latlon(x, y):
 def get_address_components_from_coords(geom):
     street = ""
     municipality = ""
+    comarca = "" # Añadir comarca y provincia a la geocodificación
+    provincia = ""
     
     if geom and geom["x"] and geom["y"]:
         lat, lon = utm_to_latlon(geom["x"], geom["y"])
@@ -186,21 +194,24 @@ def get_address_components_from_coords(geom):
                 street = address_parts.get('road', '') or address_parts.get('building', '') or address_parts.get('amenity', '')
                 municipality = address_parts.get('city', '') or \
                                address_parts.get('town', '') or \
-                               address_parts.get('village', '') or \
-                               address_parts.get('county', '')
+                               address_parts.get('village', '')
+                comarca = address_parts.get('county', '') # Nominatim puede devolver la comarca aquí
+                provincia = address_parts.get('state', '') # Nominatim suele devolver la provincia aquí
 
+                # Fallback para municipio, comarca, provincia si no se encuentra directamente
                 if not municipality and loc.address:
                     parts = [p.strip() for p in loc.address.split(',')]
                     for p in reversed(parts):
-                        if not any(char.isdigit() for char in p) and len(p) > 2 and p.lower() not in ["catalunya", "españa"]:
-                            municipality = p
-                            break
-
+                        if not any(char.isdigit() for char in p) and len(p) > 2:
+                            if "provincia" in p.lower() and not provincia: provincia = p # Ejemplo: si es "Provincia de Barcelona"
+                            elif not municipio: municipio = p # Última parte sin números como municipio
+                            # Más heurística para comarca/provincia desde partes de dirección si es necesario
+                            
         except Exception as e:
             logging.debug(f"Error al geocodificar: {e}")
             pass
     
-    return {"street": street, "municipality": municipality}
+    return {"street": street, "municipality": municipality, "comarca": comarca, "provincia": provincia}
 
 
 def format_intervention_with_gemini(feature):
@@ -211,24 +222,26 @@ def format_intervention_with_gemini(feature):
     a = feature["attributes"]
     geom = feature.get("geometry")
 
-    # --- 1. Obtener Ubicación Completa (priorizando ArcGIS) ---
+    # --- 1. Obtener Ubicación Completa (priorizando ArcGIS, luego geocodificación) ---
     municipio_arcgis = a.get("MUN_NOM_MUNICIPI")
     comarca_arcgis = a.get("COM_NOM_COMARCA") 
     provincia_arcgis = a.get("PRO_NOM_PROVINCIA") 
     _full_location_from_arcgis_success = a.get("_full_location_from_arcgis_success", False)
 
-    calle_geocoded = ""
-    municipio_geocoded = ""
-    
-    address_components = get_address_components_from_coords(geom)
-    calle_final = address_components["street"] if address_components["street"] else ""
-    municipio_geocoded = address_components["municipality"] if address_components["municipality"] else ""
+    calle_geocoded_data = get_address_components_from_coords(geom) # Obtenemos todos los componentes geocodificados
+    calle_final = calle_geocoded_data["street"] if calle_geocoded_data["street"] else ""
+    municipio_geocoded = calle_geocoded_data["municipality"] if calle_geocoded_data["municipality"] else ""
+    comarca_geocoded = calle_geocoded_data["comarca"] if calle_geocoded_data["comarca"] else ""
+    provincia_geocoded = calle_geocoded_data["provincia"] if calle_geocoded_data["provincia"] else ""
+
 
     # Construir location_str lo más completo posible para Gemini
     location_parts = []
+    # Prioriza calle de geocodificación
     if calle_final: 
         location_parts.append(calle_final)
     
+    # Intenta usar la ubicación completa de ArcGIS si está disponible y es fiable
     if _full_location_from_arcgis_success: 
         if municipio_arcgis and municipio_arcgis not in location_parts:
             location_parts.append(municipio_arcgis)
@@ -236,8 +249,13 @@ def format_intervention_with_gemini(feature):
             location_parts.append(comarca_arcgis)
         if provincia_arcgis and provincia_arcgis not in location_parts:
             location_parts.append(provincia_arcgis)
-    elif municipio_geocoded and municipio_geocoded not in location_parts:
-        location_parts.append(municipio_geocoded)
+    else: # Si ArcGIS no dio la ubicación completa o falló, usar geocodificación como fallback
+        if municipio_geocoded and municipio_geocoded not in location_parts:
+            location_parts.append(municipio_geocoded)
+        if comarca_geocoded and comarca_geocoded not in location_parts:
+            location_parts.append(comarca_geocoded)
+        if provincia_geocoded and provincia_geocoded not in location_parts:
+            location_parts.append(provincia_geocoded)
     
     location_str = ", ".join(location_parts) if location_parts else "ubicació desconeguda"
 
@@ -256,9 +274,10 @@ def format_intervention_with_gemini(feature):
         "dotaciones": a.get("ACT_NUM_VEH"),
         "fase": a.get("COM_FASE"),
         "ubicacion_completa": location_str, 
+        # Asegurarse de que estos campos siempre tienen un valor, incluso si es ""
         "municipio": municipio_arcgis if _full_location_from_arcgis_success else municipio_geocoded,
-        "comarca": comarca_arcgis if _full_location_from_arcgis_success else "", 
-        "provincia": provincia_arcgis if _full_location_from_arcgis_success else "", 
+        "comarca": comarca_arcgis if _full_location_from_arcgis_success else comarca_geocoded,
+        "provincia": provincia_arcgis if _full_location_from_arcgis_success else provincia_geocoded,
         "hora": hora_str,
         "fecha": fecha_str,
         "tipo_clasificado": classify(a) 
@@ -272,6 +291,7 @@ def format_intervention_with_gemini(feature):
     if gemini_model: 
         try:
             # --- 3. Llamada a Gemini para interpretación ---
+            # Prompt mejorado: mayor detalle, síntesis del tipo, precisión geográfica, JSON puro.
             prompt_interpret = f"""Analiza el siguiente incidente de Bombers y proporciona un resumen descriptivo e informativo.
             Datos del incidente:
             - Tipo alarma principal de Bombers: {incident_data_for_gemini['tipo_alarma1']}
@@ -318,7 +338,17 @@ def format_intervention_with_gemini(feature):
 
             # --- 4. Llamada a Gemini para búsqueda (si es relevante) ---
             if gemini_relevance >= 7 and search_keywords: 
-                query = f"incendio {location_str} {' '.join(search_keywords)} últimas noticias"
+                # Query de búsqueda más precisa
+                search_query_parts = []
+                if incident_data_for_gemini['municipio']:
+                    search_query_parts.append(incident_data_for_gemini['municipio'])
+                if incident_data_for_gemini['comarca']:
+                    search_query_parts.append(incident_data_for_gemini['comarca'])
+                if incident_data_for_gemini['provincia']:
+                    search_query_parts.append(incident_data_for_gemini['provincia'])
+                
+                base_query = "incendio " + " ".join(search_query_parts) if search_query_parts else "incendio"
+                query = f"{base_query} {' '.join(search_keywords)} noticias, última hora"
                 logging.info(f"Realizando búsqueda con Gemini para: {query}")
                 
                 try:
@@ -332,7 +362,8 @@ def format_intervention_with_gemini(feature):
                          if "no se encontraron resultados" in gemini_search_summary.lower() or \
                             "no puedo encontrar" in gemini_search_summary.lower() or \
                             "no se encontraron noticias relevantes" in gemini_search_summary.lower() or \
-                            "no hay información disponible" in gemini_search_summary.lower(): 
+                            "no hay información disponible" in gemini_search_summary.lower() or \
+                            "no hay resultados relevantes" in gemini_search_summary.lower(): # Ampliado
                             gemini_search_summary = "No se encontraron actualizaciones relevantes en Google."
                          else:
                              logging.info(f"Gemini búsqueda: {gemini_search_summary}")
@@ -464,9 +495,7 @@ def main():
     # 1. Procesar todas las nuevas actuaciones con Gemini para obtener su relevancia y mensaje
     for feature in new_feats:
         current_object_id = feature["attributes"].get("ESRI_OID")
-        # format_intervention_with_gemini ahora devuelve mensaje, relevancia y timestamp
-        # CORRECCIÓN: el nombre de la variable era _municipio_from_success en el log del usuario, pero debería ser _municipio_from_arcgis_success
-        # AQUI SE PASA LA FEATURE COMPLETA, NO SOLO LOS ATRIBUTOS
+        
         telegram_message, relevance, timestamp = format_intervention_with_gemini(feature)
         
         all_processed_new_feats.append({
@@ -476,17 +505,16 @@ def main():
             "timestamp": timestamp
         })
         
-        time.sleep(0.5) # Pausa entre llamadas a Gemini
+        time.sleep(0.5) 
 
     # 2. Ordenar las actuaciones procesadas para seleccionar
-    # Ordenar por fecha de actuación para encontrar la más reciente general
     all_processed_new_feats.sort(key=lambda x: x["timestamp"], reverse=True)
 
     messages_to_send_final = []
-    sent_object_ids = set() # Para evitar enviar el mismo incidente dos veces
+    sent_object_ids = set() 
 
-    MAX_TOTAL_MESSAGES_PER_RUN = 3 # Número máximo de mensajes a enviar por ejecución
-    MIN_RELEVANCE_FOR_IMPORTANT = 7 # Umbral de relevancia IA para considerar "importante"
+    MAX_TOTAL_MESSAGES_PER_RUN = 3 
+    MIN_RELEVANCE_FOR_IMPORTANT = 7 
 
     # --- Añadir la actuación NUEVA más reciente (si existe) ---
     if all_processed_new_feats:
@@ -496,17 +524,13 @@ def main():
         logging.info(f"Añadida la actuación nueva más reciente (ID: {most_recent_incident['object_id']}) a la cola de envío.")
 
     # --- Añadir actuaciones importantes (relevancia >= MIN_RELEVANCE_FOR_IMPORTANT) ---
-    # Filtrar aquellas que son importantes y que no hayan sido ya la "más reciente"
     important_incidents_filtered = [
         inc for inc in all_processed_new_feats 
         if inc["relevance"] >= MIN_RELEVANCE_FOR_IMPORTANT and inc["object_id"] not in sent_object_ids
     ]
 
-    # Ordenar las importantes por relevancia (descendente) y luego por fecha (descendente)
-    # CORRECCIÓN CLAVE AQUÍ: Asegurarse de que el key es 'relevance' (minúsculas)
     important_incidents_filtered.sort(key=lambda x: (x["relevance"], x["timestamp"]), reverse=True) 
 
-    # Limitar el número de mensajes a enviar (ej. 3 mensajes en total)
     current_messages_count = len(messages_to_send_final)
 
     for incident in important_incidents_filtered:
@@ -516,7 +540,7 @@ def main():
             logging.info(f"Añadida actuación importante (ID: {incident['object_id']}, Relevancia: {incident['relevance']}) a la cola de envío.")
             current_messages_count += 1
         else:
-            break # Límite de mensajes alcanzado
+            break 
 
     if not messages_to_send_final:
         logging.info("No hay actuaciones nuevas que cumplan los criterios para ser enviadas.")
@@ -524,12 +548,11 @@ def main():
     # --- Envío de los mensajes finales ---
     for message_content in messages_to_send_final:
         send(message_content, None)
-        time.sleep(1) # Pausa entre envíos de mensajes a Telegram
+        time.sleep(1) 
 
     # --- FIN: Lógica de priorización y envío ---
 
     # Actualizar last_id con el ID más alto de TODAS las nuevas actuaciones procesadas
-    # Esto asegura que no se reprocesen en la siguiente ejecución.
     max_id_to_save = last_id
     if new_feats: 
         max_id_to_save = max(max_id_to_save, max(f["attributes"].get("ESRI_OID", 0) for f in new_feats if f["attributes"].get("ESRI_OID")))
