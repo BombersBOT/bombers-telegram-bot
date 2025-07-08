@@ -22,6 +22,7 @@ from urllib3.util.retry import Retry
 
 # Importar la librería de Gemini
 import google.generativeai as genai 
+import google.generativeai.tools as tools # <--- NUEVA IMPORTACIÓN para acceder a las herramientas
 
 # --- CONFIG ---
 LAYER_URL = ("https://services7.arcgis.com/ZCqVt1fRXwwK6GF4/arcgis/rest/services/"
@@ -37,7 +38,7 @@ STATE_FILE = Path("state.json")
 GEOCODER   = Nominatim(user_agent="bombers_bot")
 TRANSFORM  = Transformer.from_crs(25831, 4326, always_xy=True)
 
-# Credenciales de X (Twitter) - Se mantienen, pero no se usan para publicar
+# Credenciales de X (Twitter) - Se mantienen para compatibilidad, pero no se usan para publicar
 TW_KEYS = {
     "ck": os.getenv("TW_CONSUMER_KEY"),
     "cs": os.getenv("TW_CONSUMER_SECRET"),
@@ -55,8 +56,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    # Puedes ajustar el modelo ('gemini-pro', 'gemini-pro-vision') y la temperatura
-    # La temperatura más baja (~0.2) es mejor para resultados más deterministas/fácticos.
     gemini_model = genai.GenerativeModel(
         'gemini-pro', 
         generation_config={"temperature": 0.2}
@@ -64,14 +63,11 @@ if GEMINI_API_KEY:
     logging.info("API de Gemini configurada.")
 else:
     logging.warning("GEMINI_API_KEY no configurada. Las funciones de IA no estarán disponibles.")
-    gemini_model = None # Asegurarse de que el modelo es None si la clave no está
+    gemini_model = None 
 
 # Habilitar la extensión de Google Search para Gemini (si el modelo lo soporta y está habilitado en tu cuenta)
-# Esto es crucial para que Gemini pueda "buscar en Google"
-# La integración de tools/extensions requiere que tu modelo haya sido configurado para ello en Google AI Studio
-# Puedes usar un modelo que ya tenga Search activado o configurarlo si tu plan lo permite.
-search_tool = genai.tool_code.GoogleSearch # Asume que esta herramienta está disponible y activada
-
+# Este es el cambio que soluciona el AttributeError
+search_tool = tools.GoogleSearch # <--- CAMBIO AQUÍ: Ahora se referencia correctamente
 # --- FIN Configuración de Gemini ---
 
 logging.basicConfig(level=logging.INFO,
@@ -115,7 +111,6 @@ def fetch_features(limit=100):
         return []
     except requests.exceptions.RequestException as e:
         logging.error(f"Error de conexión al consultar ArcGIS: {e}")
-        # Fallback a la consulta sin MUN_NOM_MUNICIPI si da error 400
         if "400" in str(e) and "Invalid query parameters" in str(e):
             logging.warning("Error 400 al obtener MUN_NOM_MUNICIPI. Intentando sin él.")
             params["outFields"] = ("ACT_NUM_VEH,COM_FASE,ESRI_OID,ACT_DAT_ACTUACIO,"
@@ -247,7 +242,7 @@ def format_intervention_with_gemini(feature):
         "fase": a.get("COM_FASE"),
         "ubicacion_geo": location_str,
         "hora": hora,
-        "tipo_calculado": classify(a) # Clasificación básica que ya tenemos
+        "tipo_clasificado": classify(a) 
     }
 
     gemini_interpretation = "No disponible (IA no configurada o error)."
@@ -264,7 +259,7 @@ def format_intervention_with_gemini(feature):
             Fase: {incident_data_for_gemini['fase']}
             Ubicación: {incident_data_for_gemini['ubicacion_geo']}
             Hora: {incident_data_for_gemini['hora']}
-            Tipo (clasificación básica): {incident_data_for_gemini['tipo_calculado']}
+            Tipo (clasificación básica): {incident_data_for_gemini['tipo_clasificado']}
 
             Proporciona un resumen conciso y descriptivo del incidente.
             Estima su relevancia en una escala del 1 (muy bajo) al 10 (muy alto) para la población.
@@ -278,27 +273,46 @@ def format_intervention_with_gemini(feature):
             """
             
             response_interpret = gemini_model.generate_content(prompt_interpret)
-            parsed_interpret = json.loads(response_interpret.text) # Gemini suele devolver JSON como string
-            gemini_interpretation = parsed_interpret.get("resumen", "Error al interpretar.")
-            gemini_relevance = int(parsed_interpret.get("relevancia", 0))
-            search_keywords = parsed_interpret.get("palabras_clave_busqueda", [])
+            # Asegurarse de que la respuesta es un texto parseable como JSON
+            try:
+                parsed_interpret = json.loads(response_interpret.text) 
+                gemini_interpretation = parsed_interpret.get("resumen", "Error al interpretar.")
+                gemini_relevance = int(parsed_interpret.get("relevancia", 0))
+                search_keywords = parsed_interpret.get("palabras_clave_busqueda", [])
+            except json.JSONDecodeError:
+                logging.warning(f"Respuesta de Gemini no es JSON válido para interpretación: {response_interpret.text}")
+                gemini_interpretation = "Resumen no disponible (Gemini no devolvió JSON válido)."
+                gemini_relevance = 0
+                search_keywords = []
 
             logging.info(f"Gemini interpretación: Relevancia={gemini_relevance}, Resumen={gemini_interpretation}")
 
             # --- 4. Llamada a Gemini para búsqueda (si es relevante) ---
-            if gemini_relevance >= 7: # Umbral de relevancia para buscar actualizaciones
-                search_query = f"incendio {location_str} {', '.join(search_keywords)}"
-                # Asegúrate de que tu modelo de Gemini tiene habilitada la extensión de Google Search
-                # Esto es crucial para que la siguiente llamada funcione
-                search_response = gemini_model.generate_content(
-                    f"Resume noticias y actualizaciones sobre: '{search_query}'. Proporciona un resumen muy conciso de no más de 3 frases.", 
-                    tools=[search_tool] # Utiliza la herramienta de búsqueda
-                )
-                gemini_search_summary = search_response.text.strip()
-                logging.info(f"Gemini búsqueda: {gemini_search_summary}")
+            if gemini_relevance >= 7 and search_keywords: # Umbral de relevancia y si hay palabras clave
+                # Crear una query de búsqueda general
+                query = f"incendio {location_str} {' '.join(search_keywords)} últimas noticias"
+                logging.info(f"Realizando búsqueda con Gemini para: {query}")
+                
+                try:
+                    search_response = gemini_model.generate_content(
+                        f"Resume muy concisamente (no más de 3 frases) noticias y actualizaciones sobre: '{query}'.", 
+                        tools=[search_tool] # Utiliza la herramienta de búsqueda de Google Search
+                    )
+                    # Verificar si la respuesta de búsqueda contiene contenido real
+                    if search_response and search_response.text:
+                         gemini_search_summary = search_response.text.strip()
+                         if "no se encontraron resultados" in gemini_search_summary.lower() or "no puedo encontrar" in gemini_search_summary.lower():
+                            gemini_search_summary = "No se encontraron actualizaciones relevantes en Google."
+                         else:
+                             logging.info(f"Gemini búsqueda: {gemini_search_summary}")
+                    else:
+                        gemini_search_summary = "Búsqueda con IA fallida o sin resultados."
+                except Exception as search_e:
+                    logging.error(f"Error al realizar búsqueda con Gemini: {search_e}")
+                    gemini_search_summary = "Búsqueda con IA fallida."
             
         except Exception as e:
-            logging.error(f"Error al interactuar con la API de Gemini: {e}")
+            logging.error(f"Error general al interactuar con la API de Gemini: {e}")
             gemini_interpretation = f"Error al interpretar con IA: {e}"
             gemini_search_summary = "Búsqueda con IA fallida."
 
@@ -311,7 +325,7 @@ def format_intervention_with_gemini(feature):
         f"<i>Resumen IA:</i> {gemini_interpretation}\n\n"
     )
     
-    if gemini_relevance >= 7 and gemini_search_summary and "no se encontraron resultados" not in gemini_search_summary.lower():
+    if gemini_relevance >= 7 and gemini_search_summary and "no se encontraron actualizaciones relevantes" not in gemini_search_summary:
          telegram_message += f"<i>Actualizaciones IA (Google):</i> {gemini_search_summary}\n\n"
     
     telegram_message += f"🌐 <a href='{MAPA_OFICIAL}'>Mapa Oficial Bombers</a>"
@@ -352,6 +366,7 @@ def send(text, api=None): # api es un argumento heredado, pero ya no se usa para
          logging.info("La publicación en X (Twitter) está deshabilitada/restringida para este bot.")
          logging.info("Texto que se intentaría publicar en X:\n" + text + "\n")
 
+
     # --- Envío a Telegram (SIEMPRE se intenta si está configurado) ---
     send_telegram_message(text)
     # --- Fin Envío a Telegram ---
@@ -360,26 +375,20 @@ def send(text, api=None): # api es un argumento heredado, pero ya no se usa para
 def main():
     last_id = load_state()
 
-    # NO se crea objeto API de Tweepy ni se autentica con X (Twitter)
-    # Ya que la publicación directa no es posible y el enfoque es Telegram.
-    
     feats = fetch_features()
     if not feats:
         logging.info("ArcGIS devolvió 0 features.")
         return
 
-    # Filtra solo las nuevas intervenciones (por ESRI_OID)
     new_feats = [f for f in feats if f["attributes"].get("ESRI_OID") and f["attributes"]["ESRI_OID"] > last_id]
 
     if not new_feats:
         logging.info("No hay intervenciones nuevas para procesar.")
         return
 
-    # Procesar y notificar todas las intervenciones nuevas una por una
-    # (Ya no usamos "más reciente" y "más relevante" en un solo mensaje, sino que procesamos cada nueva)
-    max_id_to_save = last_id
+    max_id_to_save = last_id 
     
-    # Ordenar las nuevas por fecha para procesar cronológicamente o por relevancia si se desea
+    # Ordenar las nuevas por fecha para procesar cronológicamente
     new_feats.sort(key=lambda f: f["attributes"].get("ACT_DAT_ACTUACIO", 0)) 
 
     for feature in new_feats:
