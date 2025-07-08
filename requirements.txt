@@ -4,3 +4,4 @@ geopy
 pyproj
 pytz
 google-generativeai
+google-api-python-client
