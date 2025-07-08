@@ -3,14 +3,12 @@ name: Ejecutar bot Bombers
 on:
   workflow_dispatch:        # Permite ejecutarlo manualmente desde GitHub
   schedule:
-    # Se ejecuta cada 30 minutos.
-    # La expresión cron '0,30 * * * *' significa:
-    # - En los minutos 0 y 30 de cada hora
-    # - De cada hora del día
-    # - De cada día del mes
-    # - De cada mes
-    # - De cada día de la semana
-    - cron: '0,30 * * * *'
+    # Se ejecuta cada 30 minutos, excluyendo el horario de 1:00h a 6:00h (hora de España, CEST/CET).
+    # La expresión cron 'minuto hora día_del_mes mes día_de_la_semana'.
+    # 0,30: En los minutos 0 y 30 de cada hora.
+    # 4-22: De las 4:00h UTC a las 22:59h UTC.
+    # Esto se traduce aproximadamente a 6:00h CEST a 00:59h CEST del día siguiente.
+    - cron: '0,30 4-22 * * *'
 
 jobs:
   run-bot:
@@ -35,7 +33,7 @@ jobs:
           TW_ACCESS_TOKEN: ${{ secrets.TW_ACCESS_TOKEN }}
           TW_ACCESS_SECRET: ${{ secrets.TW_ACCESS_SECRET }}
           MIN_DOTACIONS: "5"
-          GEOCODER_USER_AGENT: bombers_bot_1.0
+          GEOCODER_USER_AGENT: bombers_bot.1.0
           IS_TEST_MODE: "true" # Mantenemos en true para que NO intente publicar en X, solo en Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
