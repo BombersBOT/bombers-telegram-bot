@@ -59,8 +59,8 @@ if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         gemini_model = genai.GenerativeModel(
-            'models/gemini-1.5-flash', # Asegurarse de que este es el modelo correcto
-            generation_config={"temperature": 0.2} # Temperatura baja para factualidad
+            'models/gemini-1.5-flash', 
+            generation_config={"temperature": 0.2}
         )
         logging.info("API de Gemini configurada y modelo 'models/gemini-1.5-flash' inicializado.")
     except Exception as e:
@@ -93,11 +93,10 @@ def fetch_features(limit=100):
     params = {
         "f": "json",
         "where": "1=1",
-        # Incluimos COM_NOM_COMARCA y PRO_NOM_PROVINCIA para mejorar la precisión geográfica
         "outFields": (
             "ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
             "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM_MUNICIPI,"
-            "COM_NOM_COMARCA,PRO_NOM_PROVINCIA" # <-- CAMPOS DE UBICACIÓN AÑADIDOS
+            "COM_NOM_COMARCA,PRO_NOM_PROVINCIA" 
         ),
         "orderByFields": "ACT_DAT_ACTUACIO DESC",
         "resultRecordCount": limit,
@@ -115,10 +114,8 @@ def fetch_features(limit=100):
         return []
     except requests.exceptions.RequestException as e:
         logging.error(f"Error de conexión al consultar ArcGIS: {e}")
-        # Lógica de fallback si la consulta inicial falla (ej. por campos)
         if "400" in str(e) and "Invalid query parameters" in str(e):
             logging.warning("Error 400 al obtener campos de ubicación de ArcGIS. Intentando sin ellos.")
-            # Si la consulta con campos de ubicación falla, hacemos un fallback sin ellos.
             params["outFields"] = ("ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
                                    "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
             try:
@@ -126,7 +123,6 @@ def fetch_features(limit=100):
                 r.raise_for_status()
                 data = r.json()
                 for feature in data.get("features", []):
-                    # Marcamos que la ubicación no vino completa de ArcGIS
                     feature["attributes"]["_full_location_from_arcgis_success"] = False 
                 return data.get("features", [])
             except requests.exceptions.RequestException as e_fallback:
@@ -137,24 +133,22 @@ def fetch_features(limit=100):
     data = r.json()
     if "error" in data:
         logging.error("ArcGIS devolvió un error en los datos: %s", data["error"]["message"])
-        # Otro fallback si el error viene en el JSON de datos
         if data["error"]["code"] == 400 and "Invalid query parameters" in data["error"]["message"]:
-             logging.warning("Error 400 al obtener campos de ubicación de ArcGIS. Intentando sin ellos. (Post-JSON parse)")
-             params["outFields"] = ("ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
+            logging.warning("Error 400 al obtener campos de ubicación de ArcGIS. Intentando sin ellos. (Post-JSON parse)")
+            params["outFields"] = ("ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
                                    "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
-             try:
+            try:
                 r = session.get(f"{LAYER_URL}/query", params=params, timeout=30)
                 r.raise_for_status()
                 data = r.json()
                 for feature in data.get("features", []):
                     feature["attributes"]["_full_location_from_arcgis_success"] = False
                 return data.get("features", [])
-             except requests.exceptions.RequestException as e_fallback:
+            except requests.exceptions.RequestException as e_fallback:
                 logging.error(f"Error en fallback de ArcGIS: {e_fallback}")
                 return []
         return []
     
-    # Marcamos que la ubicación completa SÍ vino de ArcGIS
     for feature in data.get("features", []):
         feature["attributes"]["_full_location_from_arcgis_success"] = True
     return data.get("features", [])
@@ -219,8 +213,8 @@ def format_intervention_with_gemini(feature):
 
     # --- 1. Obtener Ubicación Completa (priorizando ArcGIS) ---
     municipio_arcgis = a.get("MUN_NOM_MUNICIPI")
-    comarca_arcgis = a.get("COM_NOM_COMARCA") # Nuevo campo
-    provincia_arcgis = a.get("PRO_NOM_PROVINCIA") # Nuevo campo
+    comarca_arcgis = a.get("COM_NOM_COMARCA") 
+    provincia_arcgis = a.get("PRO_NOM_PROVINCIA") 
     _full_location_from_arcgis_success = a.get("_full_location_from_arcgis_success", False)
 
     calle_geocoded = ""
@@ -238,9 +232,9 @@ def format_intervention_with_gemini(feature):
     if _full_location_from_arcgis_success: 
         if municipio_arcgis and municipio_arcgis not in location_parts:
             location_parts.append(municipio_arcgis)
-        if comarca_arcgis and comarca_arcgis not in location_parts: # Nuevo
+        if comarca_arcgis and comarca_arcgis not in location_parts:
             location_parts.append(comarca_arcgis)
-        if provincia_arcgis and provincia_arcgis not in location_parts: # Nuevo
+        if provincia_arcgis and provincia_arcgis not in location_parts:
             location_parts.append(provincia_arcgis)
     elif municipio_geocoded and municipio_geocoded not in location_parts:
         location_parts.append(municipio_geocoded)
@@ -253,7 +247,7 @@ def format_intervention_with_gemini(feature):
                       .astimezone(ZoneInfo("Europe/Madrid"))
     
     hora_str = hora_dt.strftime("%H:%M")
-    fecha_str = hora_dt.strftime("%d/%m/%Y") # Incluir el día del aviso
+    fecha_str = hora_dt.strftime("%d/%m/%Y") 
 
     # --- 2. Preparar datos para Gemini ---
     incident_data_for_gemini = {
@@ -263,8 +257,8 @@ def format_intervention_with_gemini(feature):
         "fase": a.get("COM_FASE"),
         "ubicacion_completa": location_str, 
         "municipio": municipio_arcgis if _full_location_from_arcgis_success else municipio_geocoded,
-        "comarca": comarca_arcgis if _full_location_from_arcgis_success else "", # Nuevo
-        "provincia": provincia_arcgis if _full_location_from_arcgis_success else "", # Nuevo
+        "comarca": comarca_arcgis if _full_location_from_arcgis_success else "", 
+        "provincia": provincia_arcgis if _full_location_from_arcgis_success else "", 
         "hora": hora_str,
         "fecha": fecha_str,
         "tipo_clasificado": classify(a) 
@@ -278,7 +272,6 @@ def format_intervention_with_gemini(feature):
     if gemini_model: 
         try:
             # --- 3. Llamada a Gemini para interpretación ---
-            # Prompt mejorado: mayor detalle, síntesis del tipo, precisión geográfica, JSON puro.
             prompt_interpret = f"""Analiza el siguiente incidente de Bombers y proporciona un resumen descriptivo e informativo.
             Datos del incidente:
             - Tipo alarma principal de Bombers: {incident_data_for_gemini['tipo_alarma1']}
@@ -295,7 +288,7 @@ def format_intervention_with_gemini(feature):
             Proporciona un resumen conciso y muy descriptivo del incidente (entre 3 y 5 frases).
             Asegúrate de fusionar el tipo de alarma principal, secundaria y la clasificación general de forma natural y sin redundancias.
             Confirma la ubicación geográfica exacta (municipio, comarca, provincia) si se ha proporcionado, evitando errores.
-            Estima su relevancia en una escala del 1 (muy bajo, poco impacto) al 10 (muy alto, gran impacto o peligro) para la población afectada.
+            Estima su relevancia en una escala del 1 (muy bajo) al 10 (muy alto) para la población.
             Sugiere 2-3 palabras clave o hashtags (ej. #Incendio[Municipio], #Incendio[Tipo]) para buscar actualizaciones en Google. Asegúrate de que las palabras clave geográficas sean exactas y no infieras provincias si no se han dado.
             Formato de salida (JSON, solo el objeto JSON, sin envolver en bloques de código ni texto adicional):
             {{
@@ -325,7 +318,7 @@ def format_intervention_with_gemini(feature):
 
             # --- 4. Llamada a Gemini para búsqueda (si es relevante) ---
             if gemini_relevance >= 7 and search_keywords: 
-                query = f"incendio {incident_data_for_gemini['ubicacion_completa']} {incident_data_for_gemini['municipio']} {incident_data_for_gemini['provincia']} {' '.join(search_keywords)} noticias, última hora"
+                query = f"incendio {location_str} {' '.join(search_keywords)} últimas noticias"
                 logging.info(f"Realizando búsqueda con Gemini para: {query}")
                 
                 try:
@@ -336,11 +329,10 @@ def format_intervention_with_gemini(feature):
                     
                     if search_response and search_response.text:
                          gemini_search_summary = search_response.text.strip()
-                         # Intentar detectar si no hay resultados reales por parte de Gemini
                          if "no se encontraron resultados" in gemini_search_summary.lower() or \
                             "no puedo encontrar" in gemini_search_summary.lower() or \
                             "no se encontraron noticias relevantes" in gemini_search_summary.lower() or \
-                            "no hay información disponible" in gemini_search_summary.lower(): # Ampliado
+                            "no hay información disponible" in gemini_search_summary.lower(): 
                             gemini_search_summary = "No se encontraron actualizaciones relevantes en Google."
                          else:
                              logging.info(f"Gemini búsqueda: {gemini_search_summary}")
@@ -360,13 +352,12 @@ def format_intervention_with_gemini(feature):
 
     # --- 5. Construir el mensaje final para Telegram (HTML) ---
     telegram_message = (
-        f"🚨 <b>AVÍS BOMBERS</b> | {incident_data_for_gemini['ubicacion_completa']} 🚨\n\n"
+        f"🚨 <b>AVÍS BOMBERS</b> | {location_str} 🚨\n\n"
         f"<b>Fecha:</b> {fecha_str} | <b>Hora:</b> {hora_str} | <b>Dotaciones:</b> {a.get('ACT_NUM_VEH')} | <b>Fase:</b> {a.get('COM_FASE', 'Desconeguda')}\n"
         f"<b>Relevancia IA:</b> {gemini_relevance}/10\n\n"
-        f"<i>Resumen IA:</i> {gemini_interpretation}\n\n" # El resumen ya debería incluir el tipo natural
+        f"<i>Resumen IA:</i> {gemini_interpretation}\n\n" 
     )
     
-    # Solo añadir actualizaciones si son relevantes y no son el mensaje por defecto de "no hay"
     if gemini_relevance >= 7 and gemini_search_summary and "no se encontraron actualizaciones relevantes" not in gemini_search_summary:
          telegram_message += f"<i>Actualizaciones IA (Google):</i> {gemini_search_summary}\n\n"
     
@@ -467,13 +458,15 @@ def main():
         logging.info("No hay intervenciones nuevas para procesar.")
         return
 
-    # --- INICIO: Lógica de priorización y envío (revisada) ---
+    # --- INICIO: Lógica de priorización y envío ---
     all_processed_new_feats = []
 
     # 1. Procesar todas las nuevas actuaciones con Gemini para obtener su relevancia y mensaje
     for feature in new_feats:
         current_object_id = feature["attributes"].get("ESRI_OID")
         # format_intervention_with_gemini ahora devuelve mensaje, relevancia y timestamp
+        # CORRECCIÓN: el nombre de la variable era _municipio_from_success en el log del usuario, pero debería ser _municipio_from_arcgis_success
+        # AQUI SE PASA LA FEATURE COMPLETA, NO SOLO LOS ATRIBUTOS
         telegram_message, relevance, timestamp = format_intervention_with_gemini(feature)
         
         all_processed_new_feats.append({
@@ -510,7 +503,8 @@ def main():
     ]
 
     # Ordenar las importantes por relevancia (descendente) y luego por fecha (descendente)
-    important_incidents_filtered.sort(key=lambda x: (x["relevancia"], x["timestamp"]), reverse=True) # <-- Corregido: relevance, no 'relevance'
+    # CORRECCIÓN CLAVE AQUÍ: Asegurarse de que el key es 'relevance' (minúsculas)
+    important_incidents_filtered.sort(key=lambda x: (x["relevance"], x["timestamp"]), reverse=True) 
 
     # Limitar el número de mensajes a enviar (ej. 3 mensajes en total)
     current_messages_count = len(messages_to_send_final)
