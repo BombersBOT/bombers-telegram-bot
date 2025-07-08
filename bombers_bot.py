@@ -93,7 +93,6 @@ def fetch_features(limit=100):
     params = {
         "f": "json",
         "where": "1=1",
-        # Incluimos COM_NOM_COMARCA y PRO_NOM_PROVINCIA para mejorar la precisión geográfica
         "outFields": (
             "ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
             "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2,MUN_NOM_MUNICIPI,"
@@ -115,10 +114,8 @@ def fetch_features(limit=100):
         return []
     except requests.exceptions.RequestException as e:
         logging.error(f"Error de conexión al consultar ArcGIS: {e}")
-        # Lógica de fallback si la consulta inicial falla (ej. por campos)
         if "400" in str(e) and "Invalid query parameters" in str(e):
             logging.warning("Error 400 al obtener campos de ubicación de ArcGIS. Intentando sin ellos.")
-            # Si la consulta con campos de ubicación falla, hacemos un fallback sin ellos.
             params["outFields"] = ("ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
                                    "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
             try:
@@ -126,7 +123,6 @@ def fetch_features(limit=100):
                 r.raise_for_status()
                 data = r.json()
                 for feature in data.get("features", []):
-                    # Marcamos que la ubicación no vino completa de ArcGIS
                     feature["attributes"]["_full_location_from_arcgis_success"] = False 
                 return data.get("features", [])
             except requests.exceptions.RequestException as e_fallback:
@@ -137,24 +133,22 @@ def fetch_features(limit=100):
     data = r.json()
     if "error" in data:
         logging.error("ArcGIS devolvió un error en los datos: %s", data["error"]["message"])
-        # Otro fallback si el error viene en el JSON de datos
         if data["error"]["code"] == 400 and "Invalid query parameters" in data["error"]["message"]:
-             logging.warning("Error 400 al obtener campos de ubicación de ArcGIS. Intentando sin ellos. (Post-JSON parse)")
-             params["outFields"] = ("ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
+            logging.warning("Error 400 al obtener campos de ubicación de ArcGIS. Intentando sin ellos. (Post-JSON parse)")
+            params["outFields"] = ("ESRI_OID,ACT_NUM_VEH,COM_FASE,ACT_DAT_ACTUACIO,"
                                    "TAL_DESC_ALARMA1,TAL_DESC_ALARMA2")
-             try:
+            try:
                 r = session.get(f"{LAYER_URL}/query", params=params, timeout=30)
                 r.raise_for_status()
                 data = r.json()
                 for feature in data.get("features", []):
                     feature["attributes"]["_full_location_from_arcgis_success"] = False
                 return data.get("features", [])
-             except requests.exceptions.RequestException as e_fallback:
+            except requests.exceptions.RequestException as e_fallback:
                 logging.error(f"Error en fallback de ArcGIS: {e_fallback}")
                 return []
         return []
     
-    # Marcamos que la ubicación completa SÍ vino de ArcGIS
     for feature in data.get("features", []):
         feature["attributes"]["_full_location_from_arcgis_success"] = True
     return data.get("features", [])
@@ -182,7 +176,7 @@ def utm_to_latlon(x, y):
 def get_address_components_from_coords(geom):
     street = ""
     municipality = ""
-    comarca = "" # Añadir comarca y provincia a la geocodificación
+    comarca = "" 
     provincia = ""
     
     if geom and geom["x"] and geom["y"]:
@@ -195,17 +189,15 @@ def get_address_components_from_coords(geom):
                 municipality = address_parts.get('city', '') or \
                                address_parts.get('town', '') or \
                                address_parts.get('village', '')
-                comarca = address_parts.get('county', '') # Nominatim puede devolver la comarca aquí
-                provincia = address_parts.get('state', '') # Nominatim suele devolver la provincia aquí
+                comarca = address_parts.get('county', '') 
+                provincia = address_parts.get('state', '') 
 
-                # Fallback para municipio, comarca, provincia si no se encuentra directamente
                 if not municipality and loc.address:
                     parts = [p.strip() for p in loc.address.split(',')]
                     for p in reversed(parts):
                         if not any(char.isdigit() for char in p) and len(p) > 2:
-                            if "provincia" in p.lower() and not provincia: provincia = p # Ejemplo: si es "Provincia de Barcelona"
-                            elif not municipio: municipio = p # Última parte sin números como municipio
-                            # Más heurística para comarca/provincia desde partes de dirección si es necesario
+                            if "provincia" in p.lower() and not provincia: provincia = p 
+                            elif not municipio: municipio = p 
                             
         except Exception as e:
             logging.debug(f"Error al geocodificar: {e}")
@@ -228,7 +220,7 @@ def format_intervention_with_gemini(feature):
     provincia_arcgis = a.get("PRO_NOM_PROVINCIA") 
     _full_location_from_arcgis_success = a.get("_full_location_from_arcgis_success", False)
 
-    calle_geocoded_data = get_address_components_from_coords(geom) # Obtenemos todos los componentes geocodificados
+    calle_geocoded_data = get_address_components_from_coords(geom) 
     calle_final = calle_geocoded_data["street"] if calle_geocoded_data["street"] else ""
     municipio_geocoded = calle_geocoded_data["municipality"] if calle_geocoded_data["municipality"] else ""
     comarca_geocoded = calle_geocoded_data["comarca"] if calle_geocoded_data["comarca"] else ""
@@ -237,11 +229,9 @@ def format_intervention_with_gemini(feature):
 
     # Construir location_str lo más completo posible para Gemini
     location_parts = []
-    # Prioriza calle de geocodificación
     if calle_final: 
         location_parts.append(calle_final)
     
-    # Intenta usar la ubicación completa de ArcGIS si está disponible y es fiable
     if _full_location_from_arcgis_success: 
         if municipio_arcgis and municipio_arcgis not in location_parts:
             location_parts.append(municipio_arcgis)
@@ -274,7 +264,6 @@ def format_intervention_with_gemini(feature):
         "dotaciones": a.get("ACT_NUM_VEH"),
         "fase": a.get("COM_FASE"),
         "ubicacion_completa": location_str, 
-        # Asegurarse de que estos campos siempre tienen un valor, incluso si es ""
         "municipio": municipio_arcgis if _full_location_from_arcgis_success else municipio_geocoded,
         "comarca": comarca_arcgis if _full_location_from_arcgis_success else comarca_geocoded,
         "provincia": provincia_arcgis if _full_location_from_arcgis_success else provincia_geocoded,
@@ -338,32 +327,33 @@ def format_intervention_with_gemini(feature):
 
             # --- 4. Llamada a Gemini para búsqueda (si es relevante) ---
             if gemini_relevance >= 7 and search_keywords: 
-                # Query de búsqueda más precisa
-                search_query_parts = []
-                if incident_data_for_gemini['municipio']:
-                    search_query_parts.append(incident_data_for_gemini['municipio'])
-                if incident_data_for_gemini['comarca']:
-                    search_query_parts.append(incident_data_for_gemini['comarca'])
-                if incident_data_for_gemini['provincia']:
-                    search_query_parts.append(incident_data_for_gemini['provincia'])
+                # Consulta de búsqueda más precisa: utiliza todos los componentes geográficos conocidos.
+                search_geo_parts = []
+                if incident_data_for_gemini['municipio']: search_geo_parts.append(incident_data_for_gemini['municipio'])
+                if incident_data_for_gemini['comarca']: search_geo_parts.append(incident_data_for_gemini['comarca'])
+                if incident_data_for_gemini['provincia']: search_geo_parts.append(incident_data_for_gemini['provincia'])
                 
-                base_query = "incendio " + " ".join(search_query_parts) if search_query_parts else "incendio"
-                query = f"{base_query} {' '.join(search_keywords)} noticias, última hora"
+                base_query_geo = " ".join(search_geo_parts) if search_geo_parts else location_str
+                
+                # Prompts ajustados para búsqueda: más general, y explícitamente pide si no hay resultados.
+                query = f"incendio {base_query_geo} {' '.join(search_keywords)} noticias" # Eliminado "última hora"
                 logging.info(f"Realizando búsqueda con Gemini para: {query}")
                 
                 try:
                     search_response = gemini_model.generate_content(
-                        f"Resume las noticias y actualizaciones más relevantes (aproximadamente 50-100 palabras, evitando 'no hay resultados') sobre: '{query}'. Enfócate en el estado actual, el impacto y si hay personas afectadas. Si la búsqueda no arroja resultados significativos, indica 'No se encontraron actualizaciones relevantes en Google'.", 
+                        f"Resume las noticias y actualizaciones más relevantes (aproximadamente 50-100 palabras) sobre: '{query}'. Enfócate en el estado actual, el impacto y si hay personas afectadas. Si la búsqueda no arroja resultados significativos o específicos del incidente, indica claramente 'No se encontraron actualizaciones relevantes en Google'.", 
                         tools=[] 
                     )
                     
                     if search_response and search_response.text:
                          gemini_search_summary = search_response.text.strip()
+                         # Criterios más amplios para detectar "no resultados"
                          if "no se encontraron resultados" in gemini_search_summary.lower() or \
                             "no puedo encontrar" in gemini_search_summary.lower() or \
                             "no se encontraron noticias relevantes" in gemini_search_summary.lower() or \
                             "no hay información disponible" in gemini_search_summary.lower() or \
-                            "no hay resultados relevantes" in gemini_search_summary.lower(): # Ampliado
+                            "no hay resultados relevantes" in gemini_search_summary.lower() or \
+                            "no se encontraron detalles específicos" in gemini_search_summary.lower(): # <-- Ampliado
                             gemini_search_summary = "No se encontraron actualizaciones relevantes en Google."
                          else:
                              logging.info(f"Gemini búsqueda: {gemini_search_summary}")
